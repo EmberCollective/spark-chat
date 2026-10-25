@@ -1,0 +1,55 @@
+[package]
+name = "spark-chat"
+version = "0.1.1"
+edition = "2021"
+description = "校园网 P2P 端到端加密聊天（持钥解锁 + 密文落盘）"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# 网络层
+libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "macros", "request-response"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+futures = "0.3"
+
+# 加密库
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+
+# 序列化与编码
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+base64 = "0.22"
+
+# vault 专用：只取 PeerId 生成能力，不引入整套网络栈
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid"] }
+
+# GUI：使用系统 WebView，本地 HTML/CSS 随客户端打包
+tauri = { version = "2", features = [] }
+# 系统标准目录（Documents/Downloads/配置目录）—— 子智能体C 追加
+dirs = "7"
+
+# 工具
+anyhow = "1"
+fs2 = "0.4"
+tempfile = "3"
+local-ip-address = "0.6"
+# libp2p request-response 的 Codec trait 用 async_trait 宏 —— 主线追加
+async-trait = "0.1"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"

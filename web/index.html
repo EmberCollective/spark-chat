@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <title>Spark Chat</title>
+    <link rel="stylesheet" href="app.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <svg
+      class="icon-defs"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <defs>
+        <symbol id="lock-icon" viewBox="0 0 24 24">
+          <rect x="5" y="10" width="14" height="11" rx="3" />
+          <path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3" />
+        </symbol>
+        <symbol id="more-icon" viewBox="0 0 24 24">
+          <circle cx="12" cy="5" r="1" />
+          <circle cx="12" cy="12" r="1" />
+          <circle cx="12" cy="19" r="1" />
+        </symbol>
+        <symbol id="clip-icon" viewBox="0 0 24 24">
+          <path
+            d="m8 13 8-8a3 3 0 0 1 4 4L10 19a5 5 0 0 1-7-7L13 2m-5 12 7-7"
+          />
+        </symbol>
+        <symbol id="send-icon" viewBox="0 0 24 24">
+          <path d="m3 4 19 8-19 8 3-8-3-8Zm3 8h16" />
+        </symbol>
+        <symbol id="file-icon" viewBox="0 0 24 24">
+          <path
+            d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5M9 13h6m-6 4h4"
+          />
+        </symbol>
+        <symbol id="back-icon" viewBox="0 0 24 24">
+          <path d="m14 6-6 6 6 6" />
+        </symbol>
+        <symbol id="download-icon" viewBox="0 0 24 24">
+          <path d="M12 3v12m-4-4 4 4 4-4M4 17v4h16v-4" />
+        </symbol>
+      </defs>
+    </svg>
+
+    <div id="startup" class="startup" role="status">正在打开 Spark Chat…</div>
+
+    <section id="auth" class="auth-screen" hidden aria-labelledby="auth-title">
+      <form id="auth-form" class="auth-card">
+        <div class="brand-avatar" aria-hidden="true">
+          <img src="logo.png" alt="" />
+        </div>
+        <p class="eyebrow">SPARK CHAT · 星星之火</p>
+        <h1 id="auth-title">欢迎，给自己配一把钥匙</h1>
+        <p id="auth-subtitle" class="subtle">
+          用口令和钥匙文件保护你的身份与聊天记录。
+        </p>
+        <label for="passphrase">解锁口令</label>
+        <input
+          id="passphrase"
+          type="password"
+          autocomplete="current-password"
+          required
+          placeholder="输入你的口令"
+        />
+        <div id="confirm-field">
+          <label for="confirm-passphrase">再输一遍口令</label
+          ><input
+            id="confirm-passphrase"
+            type="password"
+            autocomplete="new-password"
+            placeholder="两次输入保持一致"
+          />
+        </div>
+        <label for="keyfile">钥匙文件</label>
+        <div class="path-input">
+          <input
+            id="keyfile"
+            type="text"
+            required
+            spellcheck="false"
+            aria-describedby="keyfile-hint"
+          /><button id="pick-keyfile" class="quiet" type="button">选择…</button>
+        </div>
+        <p id="keyfile-hint" class="field-hint">
+          请备份钥匙文件。口令和文件缺一不可，丢失后无法恢复。
+        </p>
+        <p id="auth-error" class="error" role="alert" hidden></p>
+        <button id="authenticate" class="primary" type="submit">
+          创建并开始
+        </button>
+        <button id="auth-switch" class="text-button" type="button">
+          已有钥匙库？直接解锁
+        </button>
+      </form>
+    </section>
+
+    <main id="app" class="app" hidden>
+      <header class="chat-header">
+        <button id="home-button" class="icon-button" type="button" aria-label="返回主界面" title="返回主界面" hidden><svg aria-hidden="true"><use href="#back-icon" /></svg></button>
+        <div id="peer-avatar" class="avatar brandmark" aria-hidden="true">
+          <img src="logo.png" alt="" />
+        </div>
+        <div class="chat-identity">
+          <h1 id="peer-title">Spark Chat</h1>
+          <p id="connection-status">
+            <span class="status-dot"></span
+            ><span id="connection-label">开始一段加密聊天</span>
+          </p>
+        </div>
+        <div class="header-actions">
+          <button
+            id="lock"
+            class="icon-button"
+            type="button"
+            aria-label="锁定聊天"
+            title="锁定聊天"
+          >
+            <svg aria-hidden="true"><use href="#lock-icon" /></svg>
+          </button>
+          <details id="menu" class="menu">
+            <summary class="icon-button" aria-label="更多选项" title="更多选项">
+              <svg aria-hidden="true"><use href="#more-icon" /></svg>
+            </summary>
+            <div class="menu-popover">
+              <button id="show-details" type="button">连接详情</button>
+              <div class="my-profile">
+                <span class="avatar mini" aria-hidden="true">我</span
+                ><span id="my-id">我的身份</span>
+              </div>
+            </div>
+          </details>
+        </div>
+      </header>
+      <div id="banner" class="banner" role="alert" hidden>
+        <span id="banner-text"></span
+        ><button id="reconnect" type="button" hidden>重新连接</button
+        ><button id="dismiss-banner" type="button" aria-label="关闭提醒">
+          ×
+        </button>
+      </div>
+      <section id="workspace" class="workspace">
+        <div id="drop-hint" class="drop-hint" role="status" hidden>松开发送文件</div>
+        <section id="welcome" class="welcome" aria-labelledby="welcome-title">
+          <div class="welcome-avatar" aria-hidden="true">
+            <img src="logo.png" alt="" />
+          </div>
+          <h2 id="welcome-title">和身边的人，直接聊</h2>
+          <p id="network-hint" class="subtle"></p>
+          <div class="welcome-actions">
+            <button id="host" class="primary" type="button">创建聊天</button
+            ><button id="join" class="secondary" type="button">加入聊天</button>
+          </div>
+          <p class="field-hint">一人创建，另一人粘贴连接码加入。</p>
+          <button id="resume-chat" class="text-button" type="button" hidden>
+            返回聊天记录
+          </button>
+        </section>
+        <section id="connect-panel" class="connect-panel" hidden>
+          <button id="back-home" class="text-button back" type="button">
+            <svg aria-hidden="true"><use href="#back-icon" /></svg>返回
+          </button>
+          <h2 id="connect-title">等待好友加入</h2>
+          <p id="connect-caption" class="subtle"></p>
+          <div id="hosting">
+            <textarea
+              id="listen-code"
+              rows="4"
+              readonly
+              aria-label="我的连接码"
+              placeholder="正在准备连接码…"
+            ></textarea
+            ><button id="copy-code" class="primary" type="button" disabled>
+              复制连接码
+            </button>
+            <p class="field-hint">
+              连接码包含你的地址与公开身份，请只分享给要联系的人。
+            </p>
+          </div>
+          <form id="join-form" hidden>
+            <label class="sr-only" for="join-code">好友发来的连接码</label
+            ><textarea
+              id="join-code"
+              rows="4"
+              spellcheck="false"
+              required
+              placeholder="粘贴完整的 SPARK- 连接码"
+            ></textarea
+            ><button id="connect" class="primary" type="submit">
+              连接好友
+            </button>
+            <p id="join-status" class="field-hint" role="status"></p>
+          </form>
+        </section>
+        <div id="conversation" class="conversation" hidden>
+          <div
+            id="messages"
+            class="messages"
+            role="log"
+            aria-label="聊天记录"
+            aria-live="polite"
+          ></div>
+          <div id="empty-chat" class="empty-chat">
+            <span>加密通道已建立，打个招呼吧</span>
+          </div>
+        </div>
+      </section>
+      <form id="composer" class="composer" hidden>
+        <div class="compose-row">
+          <button
+            id="attach"
+            class="icon-button"
+            type="button"
+            aria-label="添加附件"
+            title="选择文件或拖入窗口"
+          >
+            <svg aria-hidden="true"><use href="#clip-icon" /></svg></button
+          ><label class="sr-only" for="message">输入消息</label
+          ><textarea
+            id="message" enterkeyhint="enter"
+            rows="1"
+            maxlength="1000000"
+            placeholder="输入消息…"
+          ></textarea
+          ><button
+            id="send"
+            class="icon-button send"
+            type="submit"
+            aria-label="发送消息"
+            title="发送"
+          >
+            <svg aria-hidden="true"><use href="#send-icon" /></svg>
+          </button>
+        </div>
+        <p class="keyboard-hint">Enter 发送 · Shift + Enter 换行</p>
+      </form>
+    </main>
+
+    <dialog id="lock-confirm" aria-labelledby="lock-confirm-title">
+      <h2 id="lock-confirm-title">还有文件待接收或未传完</h2>
+      <p class="subtle">
+        锁定会断开连接并取消未完成的传输；已经保存的文件仍保留在原位置。你可以先返回聊天，等待传输完成。
+      </p>
+      <div class="welcome-actions">
+        <button id="cancel-lock" class="primary" type="button">返回聊天</button
+        ><button id="confirm-lock" class="secondary" type="button">
+          仍然锁定
+        </button>
+      </div>
+    </dialog>
+    <dialog id="connection-details">
+      <div class="dialog-heading">
+        <h2>连接详情</h2>
+        <button
+          id="close-details"
+          class="icon-button"
+          type="button"
+          aria-label="关闭连接详情"
+        >
+          ×
+        </button>
+      </div>
+      <dl>
+        <dt>网络位置</dt>
+        <dd id="detail-network"></dd>
+        <dt>我的身份</dt>
+        <dd id="detail-own"></dd>
+        <dt>对方身份</dt>
+        <dd id="detail-peer">尚未连接</dd>
+      </dl>
+      <p class="field-hint">
+        通道由 Noise
+        加密。连接码中的短码不是身份核验凭据，请通过可信渠道确认对方身份。
+      </p>
+    </dialog>
+  </body>
+</html>

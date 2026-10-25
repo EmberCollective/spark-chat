@@ -1,0 +1,40 @@
+# 构建产物
+/target/
+/gen/schemas/
+/.agents/backups/
+/delivery/
+/design/*.png
+
+# 密钥与机密（根规则：密钥永不入 git）
+*.key
+*.p12
+*.pem
+keyfile*
+spark.keyfile
+*.keyfile
+*.keyfile (*)
+分发口令*.txt
+secret*.txt
+
+# 用户数据目录（vault 加密库，含包裹的私钥）
+vault/
+*.vault/
+
+# 环境与日志
+.env
+.env.*
+*.password
+*.log
+.DS_Store
+
+# Android 本机配置、签名密钥与构建缓存
+/gen/android/.gradle/
+/gen/android/**/.gradle/
+/gen/android/.idea/
+/gen/android/local.properties
+/gen/android/keystore.properties
+/gen/android/**/build/
+*.jks
+*.keystore
+
+/node_modules/

@@ -1,0 +1,10 @@
+{
+  "app": {
+    "windows": [{
+      "label": "main",
+      "title": "Spark Chat · 星星之火",
+      "backgroundColor": "#edf2eb"
+    }]
+  },
+  "bundle": { "android": { "minSdkVersion": 26 } }
+}
