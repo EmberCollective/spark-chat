@@ -100,6 +100,9 @@
       document.querySelector('[data-forum-page="network"]').click();
       check(visibleViews().length===1&&visibleViews()[0].id==="forum-view-network","网络设置不与主题列表堆叠");
       document.querySelector('[data-forum-page="admin"]').click();
+      check($("forum-invite-card").hidden,"成员页面默认不堆叠邀请表单");
+      $("forum-invite-open").click();check(!$("forum-invite-card").hidden,"邀请成员按需展开独立卡片");
+      $("forum-invite-cancel").click();check($("forum-invite-card").hidden,"取消邀请收起表单且保留成员列表");
       document.querySelector('[data-forum-admin-tab="boards"]').click();
       check(!$("forum-admin-boards").hidden&&$("forum-admin-members").hidden,"管理后台按任务拆分子页");
       document.querySelector('[data-forum-page="home"]').click();await tick();

@@ -125,7 +125,7 @@
     if (serialized === rendered) return;
     rendered = serialized;
     const changedCommunity = snapshot?.current_community && data.current_community !== snapshot.current_community;
-    if(changedCommunity){selected=null;requested.clear();searchResult=null;page="home";$f("forum-search").value="";}
+    if(changedCommunity){$f("forum-invite-card").hidden=true;selected=null;requested.clear();searchResult=null;page="home";$f("forum-search").value="";}
     snapshot = data;
     pageOffset = data.page_offset || 0;
     if (Object.hasOwn(data, "focused_topic")) selected = data.focused_topic;
@@ -178,6 +178,7 @@
     }
     renderTopics();
     if (selected && !$f("forum-search").value.trim()) renderDetail();
+    $f("forum-member-count").textContent=`· ${(data.members||[]).length} 人`;
     const members = $f("forum-members");
     members.replaceChildren();
     for (const member of data.members || []) {
@@ -415,7 +416,12 @@
   $f("forum-join").addEventListener("click", () => createOrJoin({ kind: "join", code: $f("forum-join-code").value.trim() }));
   $f("forum-listen").addEventListener("click", () => run({ kind: "listen" }));
   $f("forum-connect").addEventListener("click", () => run({ kind: "connect", code: $f("forum-peer-code").value.trim() }));
-  $f("forum-admit").addEventListener("click", () => run({ kind: "admit", member: $f("forum-member-key").value.trim(), inviter: $f("forum-inviter").value.trim() || null }));
+  $f("forum-invite-open").addEventListener("click",()=>{$f("forum-invite-card").hidden=false;$f("forum-member-key").focus();});
+  $f("forum-invite-cancel").addEventListener("click",()=>{$f("forum-invite-card").hidden=true;});
+  $f("forum-admit").addEventListener("click", async () => {
+    const result=await run({ kind: "admit", member: $f("forum-member-key").value.trim(), inviter: $f("forum-inviter").value.trim() || null });
+    if(result){$f("forum-invite-card").hidden=true;showPage("network");$f("forum-code-box").open=true;}
+  });
   $f("forum-checkpoint").addEventListener("click", async()=>{
     const records=[...new Set((snapshot?.topics||[]).flatMap(t=>t.versions.filter(v=>!v.disputed).map(v=>v.id)))].sort();
     if(!records.length){note("没有可确认的已同步历史。");return;}
@@ -460,7 +466,7 @@
     epoch += 1; rendered = ""; requested.clear();
     clearTimeout(draftTimer); clearTimeout(searchTimer); searchGeneration++; searchResult = null;
     attachments=[];renderAttachments();
-    snapshot = null; selected = null; parents = []; page="home";
+    snapshot = null; selected = null; parents = []; page="home"; $f("forum-invite-card").hidden=true;
     panel.hidden = true; document.body.classList.remove("forum-mode"); detail.replaceChildren(); list.replaceChildren();
     if($f("forum-profile-dialog")?.open)$f("forum-profile-dialog").close();
     for(const id of ["forum-community-list","forum-owned-communities","forum-side-categories","forum-members","forum-reports","forum-downloads"]) $f(id)?.replaceChildren();
