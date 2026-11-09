@@ -38,6 +38,11 @@ pub enum NetPosKind {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum UiEvent {
+    SessionEvent {
+        session_id: String,
+        event: Box<UiEvent>,
+    },
+    SessionsChanged(Vec<crate::app::InitialSession>),
     NetPosition(String),
     NetPositionKind {
         text: String,

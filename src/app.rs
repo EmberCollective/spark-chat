@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 const MAX_TEXT: usize = 1024 * 1024;
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InitialFile {
     pub id: String,
     pub name: String,
@@ -21,8 +21,31 @@ pub struct InitialFile {
     pub failed: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct InitialSession {
+    pub id: String,
+    pub connected: bool,
+    pub history: Vec<UiMsg>,
+    pub files: Vec<InitialFile>,
+}
+
+#[derive(Default)]
+struct ChatState {
+    session: Option<Session>,
+    peer_pid: Option<String>,
+    peer_key: Option<[u8; 32]>,
+    msgs: Vec<UiMsg>,
+    early_msgs: Vec<UiMsg>,
+    early_overflowed: bool,
+    files: HashMap<u64, String>,
+    transfers: HashMap<(bool, u64), InitialFile>,
+    incoming_ids: HashMap<u64, u64>,
+}
+
 #[derive(Serialize)]
 pub struct InitialState {
+    pub active_session: String,
+    pub sessions: Vec<InitialSession>,
     pub vault_created: bool,
     pub mobile: bool,
     pub keyfile: String,
@@ -43,6 +66,8 @@ struct Prefs {
 }
 
 pub struct App {
+    chats: HashMap<String, ChatState>,
+    multi: bool,
     dir: PathBuf,
     vault: Option<Vault>,
     session: Option<Session>,
@@ -79,6 +104,8 @@ impl App {
 
     pub(crate) fn with_dir(dir: PathBuf) -> Self {
         Self {
+            chats: HashMap::new(),
+            multi: false,
             dir,
             vault: None,
             session: None,
@@ -100,6 +127,125 @@ impl App {
         }
     }
 
+    pub(crate) fn forum_material(&self) -> Result<([u8; 32], PathBuf), String> {
+        let vault = self.vault.as_ref().ok_or("请先解锁")?;
+        Ok((vault.ed25519_seed(), self.dir.clone()))
+    }
+
+    pub fn active_session(&self) -> String {
+        self.peer_pid.clone().unwrap_or_default()
+    }
+
+    fn swap_chat(&mut self, state: &mut ChatState) {
+        std::mem::swap(&mut self.session, &mut state.session);
+        std::mem::swap(&mut self.peer_pid, &mut state.peer_pid);
+        std::mem::swap(&mut self.peer_key, &mut state.peer_key);
+        std::mem::swap(&mut self.msgs, &mut state.msgs);
+        std::mem::swap(&mut self.early_msgs, &mut state.early_msgs);
+        std::mem::swap(&mut self.early_overflowed, &mut state.early_overflowed);
+        std::mem::swap(&mut self.files, &mut state.files);
+        std::mem::swap(&mut self.transfers, &mut state.transfers);
+        std::mem::swap(&mut self.incoming_ids, &mut state.incoming_ids);
+    }
+
+    fn activate(&mut self, id: &str) {
+        if self.peer_pid.as_deref() == Some(id) {
+            return;
+        }
+        let previous = self.peer_pid.clone();
+        let mut state = self.chats.remove(id).unwrap_or_else(|| ChatState {
+            peer_pid: Some(id.into()),
+            ..Default::default()
+        });
+        self.swap_chat(&mut state);
+        if let Some(previous) = previous {
+            self.chats.insert(previous, state);
+        }
+    }
+
+    pub fn select_session(&mut self, id: &str) -> Result<InitialState, String> {
+        if self.peer_pid.as_deref() != Some(id) && !self.chats.contains_key(id) {
+            return Err("会话不存在".into());
+        }
+        self.activate(id);
+        Ok(self.initial_state())
+    }
+
+    fn for_session<T>(
+        &mut self,
+        id: &str,
+        operation: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.peer_pid.as_deref() != Some(id) && !self.chats.contains_key(id) {
+            return Err("会话不存在".into());
+        }
+        let previous = self.active_session();
+        self.activate(id);
+        let first = self.errors.len();
+        let result = operation(self);
+        if self.multi {
+            for event in &mut self.errors[first..] {
+                let original = std::mem::replace(event, UiEvent::Error(String::new()));
+                *event = UiEvent::SessionEvent {
+                    session_id: id.into(),
+                    event: Box::new(original),
+                };
+            }
+        }
+        self.activate(&previous);
+        result
+    }
+
+    pub fn text_to(&mut self, id: &str, text: &str) -> Result<UiMsg, String> {
+        self.for_session(id, |app| app.text(text))
+    }
+    pub fn send_path_to(&mut self, id: &str, path: &Path) -> Result<(), String> {
+        self.for_session(id, |app| app.send_path(path))
+    }
+    pub fn send_opened_to(
+        &mut self,
+        id: &str,
+        name: String,
+        file: std::fs::File,
+    ) -> Result<(), String> {
+        self.for_session(id, |app| app.send_opened(name, file))
+    }
+
+    fn session_snapshots(&self) -> Vec<InitialSession> {
+        let mut snapshots: Vec<_> = self
+            .chats
+            .iter()
+            .map(|(id, state)| InitialSession {
+                id: id.clone(),
+                connected: state.session.is_some(),
+                history: state.msgs.clone(),
+                files: state.transfers.values().cloned().collect(),
+            })
+            .collect();
+        if let Some(id) = &self.peer_pid {
+            snapshots.push(InitialSession {
+                id: id.clone(),
+                connected: self.session.is_some(),
+                history: self.msgs.clone(),
+                files: self.transfers.values().cloned().collect(),
+            });
+        }
+        snapshots.sort_by(|a, b| a.id.cmp(&b.id));
+        snapshots
+    }
+
+    fn file_owner(&self, id: u64) -> Option<String> {
+        if self.transfers.contains_key(&(false, id)) {
+            return self.peer_pid.clone();
+        }
+        self.chats.iter().find_map(|(peer, state)| {
+            state
+                .transfers
+                .contains_key(&(false, id))
+                .then(|| peer.clone())
+        })
+    }
+
     pub fn initial_state(&self) -> InitialState {
         let prefs: Prefs = std::fs::read(self.dir.join("ui-state.json"))
             .ok()
@@ -107,6 +253,8 @@ impl App {
             .unwrap_or_default();
         let position = netpos::detect();
         InitialState {
+            active_session: self.active_session(),
+            sessions: self.session_snapshots(),
             mobile: cfg!(target_os = "android"),
             vault_created: self.dir.join("vault.json").is_file(),
             keyfile: prefs.keyfile.unwrap_or_else(|| {
@@ -187,7 +335,8 @@ impl App {
             )));
         }
         self.my_pid = v.peer_id();
-        let (cmd, evt) = net::spawn(v.ed25519_seed(), v.x25519_pub());
+        let (cmd, evt) = net::spawn_multi(v.ed25519_seed(), v.x25519_pub());
+        self.multi = true;
         self.net_cmd = Some(cmd);
         self.net_evt = Some(evt);
         self.vault = Some(v);
@@ -200,6 +349,8 @@ impl App {
     }
 
     pub fn lock(&mut self) {
+        self.chats.clear();
+        self.multi = false;
         if let Some(tx) = self.net_cmd.take() {
             let _ = tx.send(NetCmd::Shutdown);
         }
@@ -224,6 +375,18 @@ impl App {
             .ok_or_else(|| "网络尚未启动，请先解锁".into())
     }
     fn send(&self, command: NetCmd) -> Result<(), String> {
+        let command = if self.multi
+            && !matches!(
+                &command,
+                NetCmd::StartListen | NetCmd::Dial(_) | NetCmd::Shutdown
+            ) {
+            NetCmd::To {
+                peer_id: self.peer_pid.clone().ok_or("尚未选择会话")?,
+                command: Box::new(command),
+            }
+        } else {
+            command
+        };
         self.cmd()?
             .send(command)
             .map_err(|_| "网络线程已停止，请锁定后重新解锁".into())
@@ -274,41 +437,66 @@ impl App {
         }
         self.send(NetCmd::SendFile(path.to_path_buf()))
     }
-    #[cfg(target_os = "android")]
     pub(crate) fn send_opened(&self, name: String, file: std::fs::File) -> Result<(), String> {
         if self.session.is_none() {
             return Err("请先连接对方再发送文件".into());
         }
         self.send(NetCmd::SendOpenedFile { name, file })
     }
+    fn file_transfers(&self, id: u64) -> &HashMap<(bool, u64), InitialFile> {
+        self.chats
+            .values()
+            .find(|state| state.transfers.contains_key(&(false, id)))
+            .map(|state| &state.transfers)
+            .unwrap_or(&self.transfers)
+    }
+    fn file_locations(&self, id: u64) -> &HashMap<u64, String> {
+        self.chats
+            .values()
+            .find(|state| state.transfers.contains_key(&(false, id)))
+            .map(|state| &state.files)
+            .unwrap_or(&self.files)
+    }
     pub fn received_name(&self, id: u64) -> Option<String> {
-        self.transfers
+        self.file_transfers(id)
             .get(&(false, id))
             .filter(|f| !f.complete && !f.accepted && f.failed.is_empty())
             .map(|f| f.name.clone())
     }
     pub fn receive_size(&self, id: u64) -> Result<u64, String> {
-        self.transfers
+        self.file_transfers(id)
             .get(&(false, id))
             .filter(|f| !f.complete && !f.accepted && f.failed.is_empty())
             .map(|f| f.size)
             .ok_or("接收请求已失效，请让对方重新发送".into())
     }
     pub fn saved_location(&self, id: u64) -> Result<String, String> {
-        if !self.transfers.get(&(false, id)).is_some_and(|f| f.complete) {
+        if !self
+            .file_transfers(id)
+            .get(&(false, id))
+            .is_some_and(|f| f.complete)
+        {
             return Err("文件尚未接收完成".into());
         }
-        self.files.get(&id).cloned().ok_or("保存位置已失效".into())
+        self.file_locations(id)
+            .get(&id)
+            .cloned()
+            .ok_or("保存位置已失效".into())
     }
     pub fn check_receive_location(&self, id: u64, location: &str) -> Result<u64, String> {
-        if self.files.iter().any(|(other, saved)| {
+        if self
+            .files
+            .iter()
+            .chain(self.chats.values().flat_map(|state| state.files.iter()))
+            .any(|(other, saved)| {
             *other != id
                 && saved == location
                 && self
-                    .transfers
+                        .file_transfers(*other)
                     .get(&(false, *other))
                     .is_some_and(|f| !f.complete)
-        }) {
+            })
+        {
             return Err("该位置已有文件正在接收，请选择不同文件名".into());
         }
         self.receive_size(id)
@@ -319,6 +507,11 @@ impl App {
         target: crate::transfer::ReceiveTarget,
         location: String,
     ) -> Result<(), String> {
+        if let Some(owner) = self.file_owner(id) {
+            if self.peer_pid.as_deref() != Some(&owner) {
+                return self.for_session(&owner, |app| app.accept_received(id, target, location));
+            }
+        }
         self.check_receive_location(id, &location)?;
         let wire = self
             .incoming_ids
@@ -332,6 +525,11 @@ impl App {
         Ok(())
     }
     pub fn cancel_received(&mut self, id: u64) -> Result<(), String> {
+        if let Some(owner) = self.file_owner(id) {
+            if self.peer_pid.as_deref() != Some(&owner) {
+                return self.for_session(&owner, |app| app.cancel_received(id));
+            }
+        }
         let wire = self
             .incoming_ids
             .iter()
@@ -494,7 +692,19 @@ impl AppHooks for App {
                 }
                 _ => break,
             };
+            let previous = self.active_session();
+            let (source, event) = match event {
+                NetEvent::PeerEvent { peer_id, event } => {
+                    self.multi = true;
+                    self.activate(&peer_id);
+                    (Some(peer_id), *event)
+                }
+                other => (None, other),
+            };
+            let first = out.len();
+            'event: {
             match event {
+                    NetEvent::PeerEvent { .. } => unreachable!("nested peer event"),
                 NetEvent::ListenCode { code, verify } => {
                     out.push(UiEvent::ListenCode { code, verify })
                 }
@@ -508,7 +718,7 @@ impl AppHooks for App {
                             .values()
                             .any(|f| !f.outgoing && !f.complete && f.failed.is_empty())
                     {
-                        let _ = self.send(NetCmd::Shutdown);
+                            let _ = self.send(NetCmd::Disconnect);
                         self.session = None;
                         self.net_evt = None;
                         self.net_cmd = None;
@@ -519,7 +729,7 @@ impl AppHooks for App {
                             "请先保存当前附件，再锁定、重新解锁并连接新好友。原附件仍可保存。"
                                 .into(),
                         ));
-                        break;
+                            break 'event;
                     }
                     if self
                         .peer_pid
@@ -538,7 +748,7 @@ impl AppHooks for App {
                 }
                 NetEvent::PeerKey { x25519_pub } => {
                     if self.session.is_some() && self.peer_key == Some(x25519_pub) {
-                        continue;
+                            break 'event;
                     }
                     match self.open_peer(x25519_pub) {
                         Ok(history) => {
@@ -556,7 +766,7 @@ impl AppHooks for App {
                             self.clear_early();
                             self.session = None;
                             self.peer_key = None;
-                            let _ = self.send(NetCmd::Shutdown);
+                                let _ = self.send(NetCmd::Disconnect);
                             out.push(UiEvent::Disconnected(
                                 "会话未能安全打开，请锁定后重新解锁".into(),
                             ));
@@ -595,7 +805,8 @@ impl AppHooks for App {
                         } else if !self.early_overflowed {
                             self.early_overflowed = true;
                             out.push(UiEvent::Error(
-                                "握手完成前收到的消息过多，超出部分未保存，请让对方重发。".into(),
+                                    "握手完成前收到的消息过多，超出部分未保存，请让对方重发。"
+                                        .into(),
                             ));
                         }
                     }
@@ -603,7 +814,7 @@ impl AppHooks for App {
                 NetEvent::FileIncoming { id, name, size } => {
                     if self.transfers.len() >= 35 {
                         let _ = self.send(NetCmd::RejectFile { id });
-                        continue;
+                            break 'event;
                     }
                     if self.transfers.len() >= 32 {
                         if let Some(oldest) = self
@@ -712,7 +923,31 @@ impl AppHooks for App {
                 }
             }
         }
+            if let Some(source) = source {
+                for event in &mut out[first..] {
+                    let original = std::mem::replace(event, UiEvent::Error(String::new()));
+                    *event = UiEvent::SessionEvent {
+                        session_id: source.clone(),
+                        event: Box::new(original),
+                    };
+                }
+                if !previous.is_empty() {
+                    self.activate(&previous);
+                }
+            }
+        }
         if !out.is_empty() {
+            if self.multi
+                && out.iter().any(|event| match event {
+                    UiEvent::SessionEvent { event, .. } => matches!(
+                        event.as_ref(),
+                        UiEvent::Connected(_) | UiEvent::SessionReady(_) | UiEvent::Disconnected(_)
+                    ),
+                    _ => false,
+                })
+            {
+                out.push(UiEvent::SessionsChanged(self.session_snapshots()));
+            }
             self.revision += 1;
         }
         out
@@ -731,6 +966,75 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn peer_events_and_targeted_actions_keep_sessions_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v");
+        let (vault, _) = Vault::create("test-password", &tmp.path().join("kf"), &dir).unwrap();
+        let mut app = App::with_dir(dir);
+        app.vault = Some(vault);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (commands, command_rx) = std::sync::mpsc::channel();
+        app.net_evt = Some(rx);
+        app.net_cmd = Some(commands);
+        let emit = |peer: &str, event| {
+            tx.send(NetEvent::PeerEvent {
+                peer_id: peer.into(),
+                event: Box::new(event),
+            })
+            .unwrap()
+        };
+        for (peer, secret) in [("alice", [3; 32]), ("bob", [4; 32])] {
+            let key =
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret)).to_bytes();
+            emit(peer, NetEvent::Connected(peer.into()));
+            emit(peer, NetEvent::PeerKey { x25519_pub: key });
+            emit(peer, NetEvent::Msg(format!("from {peer}")));
+            emit(
+                peer,
+                NetEvent::FileIncoming {
+                    id: 1,
+                    name: format!("{peer}.txt"),
+                    size: 3,
+                },
+            );
+        }
+        let events = app.poll_events();
+        assert_eq!(app.active_session(), "alice");
+        assert_eq!(app.msgs.len(), 1);
+        assert_eq!(app.msgs[0].text, "from alice");
+        assert!(events.iter().any(|event| matches!(event, UiEvent::SessionEvent { session_id, event } if session_id == "bob" && matches!(event.as_ref(), UiEvent::Msg(s) if s == "from bob"))));
+        let snapshots = app.session_snapshots();
+        let bob_file = snapshots.iter().find(|s| s.id == "bob").unwrap().files[0]
+            .id
+            .parse::<u64>()
+            .unwrap();
+        let alice_file = snapshots.iter().find(|s| s.id == "alice").unwrap().files[0]
+            .id
+            .parse::<u64>()
+            .unwrap();
+        assert_ne!(alice_file, bob_file);
+        assert_eq!(app.received_name(bob_file).as_deref(), Some("bob.txt"));
+        app.save_received(bob_file, &tmp.path().join("bob.txt"))
+            .unwrap();
+        assert!(
+            matches!(command_rx.recv().unwrap(), NetCmd::To { peer_id, command } if peer_id == "bob" && matches!(*command, NetCmd::AcceptFile { id: 1, .. }))
+        );
+        assert_eq!(app.active_session(), "alice");
+        app.text_to("bob", "reply only to bob").unwrap();
+        assert!(
+            matches!(command_rx.recv().unwrap(), NetCmd::To { peer_id, command } if peer_id == "bob" && matches!(*command, NetCmd::SendText(ref text) if text == "reply only to bob"))
+        );
+        assert_eq!(app.msgs.len(), 1);
+        assert_eq!(app.select_session("bob").unwrap().history.len(), 2);
+        emit("alice", NetEvent::Disconnected("left".into()));
+        app.poll_events();
+        assert!(app.session.is_some());
+        assert!(!app.chats["alice"].session.is_some());
+        app.lock();
+        assert!(app.chats.is_empty() && app.msgs.is_empty());
+    }
+
     #[test]
     fn receive_requires_acceptance_and_only_opens_completed_selected_destination() {
         let tmp = tempfile::tempdir().unwrap();
