@@ -201,6 +201,7 @@ struct Worker {
     listen: Vec<Multiaddr>,
     listening: bool,
     peers: BTreeSet<PeerId>,
+    authenticating: BTreeMap<PeerId, Instant>,
     requests: HashMap<OutboundRequestId, Pending>,
     queues: HashMap<PeerId, VecDeque<Query>>,
     rates: HashMap<PeerId, (Instant, u32)>,
@@ -307,6 +308,7 @@ impl Worker {
             listen: vec![],
             listening: false,
             peers: BTreeSet::new(),
+            authenticating: BTreeMap::new(),
             requests: HashMap::new(),
             queues: HashMap::new(),
             rates: HashMap::new(),
@@ -370,10 +372,13 @@ impl Worker {
         let own = self.key.public().encode_protobuf();
         let mut topics = vec![];
         if let Some(s) = &self.saved {
-            for topic in &self.view.topics {
+            for topic in self.view.topics.iter().take(100) {
                 let root = &s.forum.records[&topic.root];
                 let mut versions = vec![];
                 for (id, r) in &s.forum.records {
+                    if self.view.pending.contains(id) {
+                        continue;
+                    }
                     if let Action::Content {
                         target,
                         body,
@@ -384,7 +389,7 @@ impl Worker {
                         if target.unwrap_or(*id) != topic.root {
                             continue;
                         }
-                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":s.forum.body(body).and_then(|b|std::str::from_utf8(b).ok()),"body_hash":hex(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash)})).collect::<Vec<_>>()}));
+                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":if topic.heads.contains(id){s.forum.body(body).and_then(|b|std::str::from_utf8(b).ok())}else{None},"body_hash":hex(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash)})).collect::<Vec<_>>()}));
                     }
                 }
                 let title = topic
@@ -401,7 +406,7 @@ impl Worker {
                 topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now()})).collect::<Vec<_>>(),"status":self.status})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":self.view.topics.len(),"truncated":self.view.topics.len()>100,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now()})).collect::<Vec<_>>(),"status":self.status})
     }
     fn apply_governance(&mut self, records: Vec<SignedRecord>) -> Result<()> {
         ensure!(records.len() <= 256, "治理记录过多");
@@ -698,7 +703,13 @@ impl Worker {
     fn next(&mut self, swarm: &mut super::wire::Swarm) {
         let Some(s) = &self.saved else { return };
         let network = s.forum.network;
-        for peer in self.peers.clone() {
+        let connected: BTreeSet<_> = self
+            .peers
+            .iter()
+            .chain(self.authenticating.keys())
+            .copied()
+            .collect();
+        for peer in connected {
             if self
                 .delayed
                 .get(&peer)
@@ -720,6 +731,15 @@ impl Worker {
                 self.requests.insert(id, Pending { peer, query });
             }
         }
+    }
+    fn shareable(&self, id: &Digest) -> bool {
+        self.saved
+            .as_ref()
+            .and_then(|s| s.forum.records.get(id))
+            .is_some_and(|r| {
+                matches!(r.record.action, Action::Governance { .. })
+                    || !self.view.pending.contains(id)
+            })
     }
     fn answer(&mut self, peer: PeerId, request: Request) -> Result<Response> {
         ensure!(
@@ -751,15 +771,19 @@ impl Worker {
                     bytes: self.read_chunk(&hash, offset)?,
                 }
             }
-            Query::Hello { .. } => Response::Hello {
-                governance: self.governance(),
-            },
+            Query::Hello { .. } => {
+                self.authenticating.remove(&peer);
+                self.peers.insert(peer);
+                Response::Hello {
+                    governance: self.governance(),
+                }
+            }
             Query::Inventory { after } => {
                 let ids: Vec<_> = s
                     .forum
                     .records
                     .keys()
-                    .filter(|id| after.is_none_or(|a| **id > a))
+                    .filter(|id| self.shareable(id) && after.is_none_or(|a| **id > a))
                     .take(129)
                     .copied()
                     .collect();
@@ -774,6 +798,7 @@ impl Worker {
                 Response::Records {
                     records: ids
                         .iter()
+                        .filter(|id| self.shareable(id))
                         .filter_map(|id| s.forum.records.get(id).cloned())
                         .collect(),
                 }
@@ -825,6 +850,8 @@ impl Worker {
             (Query::Hello { .. }, Response::Hello { governance }) => {
                 self.apply_governance(governance)?;
                 ensure!(self.allowed(&peer), "对方不是有效成员");
+                self.authenticating.remove(&peer);
+                self.peers.insert(peer);
                 self.enqueue(peer, Query::Inventory { after: None });
             }
             (Query::Inventory { after }, Response::Inventory { ids, more }) => {
@@ -908,6 +935,8 @@ impl Worker {
                         last_sync=Instant::now();
                     }
                     if self.dirty&&last_save.elapsed()>Duration::from_secs(1){if let Err(e)=self.persist(){self.status=format!("保存失败：{e}");}last_save=Instant::now();}
+                    let expired:Vec<_>=self.authenticating.iter().filter(|(_,t)|t.elapsed()>Duration::from_secs(5)).map(|(p,_)|*p).chain(self.peers.iter().filter(|p|!self.allowed(p)).copied()).collect();
+                    for peer in expired {let _=swarm.disconnect_peer_id(peer);self.authenticating.remove(&peer);self.peers.remove(&peer);self.queues.remove(&peer);}
                     self.downloads.retain(|_,d|d.updated.elapsed()<Duration::from_secs(30));
                     self.next(&mut swarm);
                 }
@@ -916,16 +945,16 @@ impl Worker {
                     SwarmEvent::ExpiredListenAddr{address,..}=>{self.listen.retain(|a|a!=&address);},
                     SwarmEvent::ConnectionEstablished{peer_id,endpoint,..}=>{
                         let local = matches!(endpoint.get_remote_address().iter().next(),Some(Protocol::Ip4(ip)) if ip.is_private() || ip.is_loopback());
-                        if !local || self.peers.len()>=8{let _=swarm.disconnect_peer_id(peer_id);}else{self.peers.insert(peer_id);self.enqueue(peer_id,Query::Hello{governance:self.governance()});}
+                        if !local || self.peers.len()>=8 || self.authenticating.len()>=4{let _=swarm.disconnect_peer_id(peer_id);}else{self.authenticating.insert(peer_id,Instant::now());let governance=if self.allowed(&peer_id){self.governance()}else{vec![]};self.enqueue(peer_id,Query::Hello{governance});}
                     }
-                    SwarmEvent::ConnectionClosed{peer_id,num_established:0,..}=>{self.peers.remove(&peer_id);self.queues.remove(&peer_id);self.rates.remove(&peer_id);self.requests.retain(|_,p|p.peer!=peer_id);},
+                    SwarmEvent::ConnectionClosed{peer_id,num_established:0,..}=>{self.peers.remove(&peer_id);self.authenticating.remove(&peer_id);self.queues.remove(&peer_id);self.rates.remove(&peer_id);self.requests.retain(|_,p|p.peer!=peer_id);},
                     SwarmEvent::Behaviour(Event::Message{peer,message,..})=>match message{
-                        Message::Request{request,channel,..}=>{let mut answer=self.answer(peer,request).unwrap_or(Response::Denied);
+                        Message::Request{request,channel,..}=>{let result=self.answer(peer,request);let reject=result.is_err();let mut answer=result.unwrap_or(Response::Denied);
                             self.credit=(self.credit+self.credit_at.elapsed().as_secs_f64()*500_000.0).min(500_000.0);self.credit_at=Instant::now();
                             let bytes=postcard::to_allocvec(&answer).map(|b|b.len()).unwrap_or(usize::MAX);
                             if bytes as f64>self.credit{answer=Response::Busy;}else{self.credit-=bytes as f64;}
-                            let _=swarm.behaviour_mut().send_response(channel,answer);},
-                        Message::Response{request_id,response}=>{if let Some(p)=self.requests.remove(&request_id){if p.peer==peer{if let Err(e)=self.receive(p,response){self.status=e.to_string();self.queues.remove(&peer);}}}},
+                            let _=swarm.behaviour_mut().send_response(channel,answer);if reject{let _=swarm.disconnect_peer_id(peer);}},
+                        Message::Response{request_id,response}=>{if let Some(p)=self.requests.remove(&request_id){if p.peer==peer{if let Err(e)=self.receive(p,response){self.status=e.to_string();self.queues.remove(&peer);let _=swarm.disconnect_peer_id(peer);}}}},
                     },
                     SwarmEvent::Behaviour(Event::OutboundFailure{request_id,error,..})=>{self.requests.remove(&request_id);self.status=format!("同步未完成：{error}");},
                     SwarmEvent::OutgoingConnectionError{error,..}=>{self.status=format!("连接失败：{error}");},
@@ -1053,6 +1082,59 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t["versions"][0]["body"] == "中文正文"));
+    }
+    #[test]
+    fn pending_records_are_not_advertised_or_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Worker::new(
+            Keypair::ed25519_from_bytes([1; 32]).unwrap(),
+            [8; 32],
+            dir.path().into(),
+        )
+        .unwrap();
+        let mut forum = Forum::new([7; 32], w.key.public().encode_protobuf()).unwrap();
+        let bad = sign_record(
+            &Keypair::ed25519_from_bytes([2; 32]).unwrap(),
+            [7; 32],
+            Action::Content {
+                target: None,
+                reply_to: None,
+                parents: vec![],
+                title: "未批准".into(),
+                body: [0; 32],
+                attachments: vec![],
+            },
+        )
+        .unwrap();
+        let hash = forum.ingest(bad).unwrap();
+        w.saved = Some(Saved {
+            name: "test".into(),
+            forum,
+            cached: BTreeMap::new(),
+        });
+        w.refresh();
+        let peer = w.key.public().to_peer_id();
+        assert!(w.view.pending.contains(&hash));
+        let result = w
+            .answer(
+                peer,
+                Request {
+                    network: [7; 32],
+                    query: Query::Inventory { after: None },
+                },
+            )
+            .unwrap();
+        assert!(matches!(result,Response::Inventory{ids,..} if ids.is_empty()));
+        let result = w
+            .answer(
+                peer,
+                Request {
+                    network: [7; 32],
+                    query: Query::Records { ids: vec![hash] },
+                },
+            )
+            .unwrap();
+        assert!(matches!(result,Response::Records{records} if records.is_empty()));
     }
     #[test]
     fn identity_of_authenticated_connection_controls_access() {
