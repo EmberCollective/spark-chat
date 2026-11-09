@@ -67,7 +67,7 @@ impl Worker {
         let mut candidate = saved.forum.clone();
         let id = candidate.ingest(record)?;
         candidate.put_body(body)?;
-        let view = candidate.rebuild();
+        let view = candidate.rebuild_at(now());
         ensure!(
             !view.pending.contains(&id) && !view.disputed.contains(&id),
             "副本存在未验证依赖"

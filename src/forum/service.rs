@@ -305,6 +305,7 @@ struct Worker {
     wanted: BTreeMap<Digest, Instant>,
     replicas: BTreeMap<Digest, BTreeSet<PeerId>>,
     replication_downloads: VecDeque<(PeerId, Digest)>,
+    next_expiry: u64,
 }
 
 impl Drop for Worker {
@@ -410,8 +411,15 @@ impl Worker {
         };
         let view = saved
             .as_ref()
-            .map(|s| s.forum.rebuild())
+            .map(|s| s.forum.rebuild_at(now()))
             .unwrap_or_default();
+        let next_expiry = view
+            .members
+            .values()
+            .filter(|m| m.expires_at > now())
+            .map(|m| m.expires_at)
+            .min()
+            .unwrap_or(u64::MAX);
         Ok(Self {
             key,
             _lock: lock,
@@ -444,12 +452,21 @@ impl Worker {
             wanted: BTreeMap::new(),
             replicas: BTreeMap::new(),
             replication_downloads: VecDeque::new(),
+            next_expiry,
         })
     }
     fn refresh(&mut self) {
         if let Some(s) = &self.saved {
-            self.view = s.forum.rebuild();
+            self.view = s.forum.rebuild_at(now());
         }
+        self.next_expiry = self
+            .view
+            .members
+            .values()
+            .filter(|m| m.expires_at > now())
+            .map(|m| m.expires_at)
+            .min()
+            .unwrap_or(u64::MAX);
         self.dirty = true;
     }
     fn persist(&mut self) -> Result<()> {
@@ -570,10 +587,21 @@ impl Worker {
                             None
                         }
                     });
-                topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"locked":topic.locked,"category":topic.category,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body(&topic.root).ok().flatten()}));
+                topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"locked":topic.locked,"category":topic.category,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body_at(&topic.root,now()).ok().flatten()}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"downloads":self.downloads.values().map(|d|json!({"hash":hex(&d.hash),"size":d.size,"received":d.received})).collect::<Vec<_>>(),"categories":self.view.categories,"reports":if self.saved.as_ref().is_some_and(|s|s.forum.admin==self.key.public().encode_protobuf()){self.view.reports.iter().map(|r|json!({"id":hex(&r.id),"target":hex(&r.target),"author":URL_SAFE_NO_PAD.encode(&r.author),"reason":r.reason})).collect::<Vec<_>>()}else{vec![]},"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"downloads":self.downloads.values().map(|d|json!({"hash":hex(&d.hash),"size":d.size,"received":d.received})).collect::<Vec<_>>(),"categories":self.view.categories,"reports":if self.saved.as_ref().is_some_and(|s|s.forum.admin==self.key.public().encode_protobuf()){self.view.reports.iter().map(|r|json!({"id":hex(&r.id),"target":hex(&r.target),"topic_id":self.report_topic(r.target).map(|h|hex(&h)),"author":URL_SAFE_NO_PAD.encode(&r.author),"reason":r.reason})).collect::<Vec<_>>()}else{vec![]},"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+    }
+    fn report_topic(&self, id: Digest) -> Option<Digest> {
+        let forum = &self.saved.as_ref()?.forum;
+        let Action::Content { target, .. } = &forum.records.get(&id)?.record.action else {
+            return None;
+        };
+        let root = target.unwrap_or(id);
+        let Action::Content { reply_to, .. } = &forum.records.get(&root)?.record.action else {
+            return None;
+        };
+        Some(reply_to.unwrap_or(root))
     }
     fn search(&self, query: &str, offset: usize) -> Result<Value> {
         let query = query.trim();
@@ -618,24 +646,32 @@ impl Worker {
         }
         Ok(json!({"query":query,"total":total,"offset":offset,"page_size":20,"results":results}))
     }
+    fn commit_forum(&mut self, candidate: Forum) -> Result<()> {
+        let previous = std::mem::replace(&mut self.saved.as_mut().unwrap().forum, candidate);
+        self.refresh();
+        if let Err(error) = self.persist() {
+            self.saved.as_mut().unwrap().forum = previous;
+            self.refresh();
+            return Err(error);
+        }
+        Ok(())
+    }
     fn apply_governance(&mut self, records: Vec<SignedRecord>) -> Result<()> {
         ensure!(records.len() <= 256, "治理记录过多");
-        let saved = self
+        let mut candidate = self
             .saved
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("尚未加入论坛"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("尚未加入论坛"))?
+            .forum
+            .clone();
         for record in records {
             ensure!(
-                matches!(record.record.action, Action::Governance { .. }),
-                "身份握手仅接受治理记录"
+                matches!(record.record.action,Action::Governance{sequence,..} if sequence<=256),
+                "治理记录类型或容量无效"
             );
-            if let Action::Governance { sequence, .. } = record.record.action {
-                ensure!(sequence <= 256, "一期治理记录容量已满");
-            }
-            saved.forum.ingest(record)?;
+            candidate.ingest(record)?;
         }
-        self.refresh();
-        Ok(())
+        self.commit_forum(candidate)
     }
     fn govern(&mut self, change: GovernanceChange) -> Result<()> {
         let s = self
@@ -662,7 +698,7 @@ impl Worker {
         let mut candidate = s.forum.clone();
         let id = candidate.ingest(r)?;
         ensure!(
-            candidate.rebuild().governance_head == Some(id),
+            candidate.rebuild_at(now()).governance_head == Some(id),
             "治理操作依赖尚未满足"
         );
         s.forum = candidate;
@@ -935,7 +971,7 @@ impl Worker {
                 )?;
                 let id = candidate.ingest(record)?;
                 ensure!(
-                    !candidate.rebuild().pending.contains(&id),
+                    !candidate.rebuild_at(now()).pending.contains(&id),
                     "举报目标尚未验证"
                 );
                 saved.forum = candidate;
@@ -1005,7 +1041,7 @@ impl Worker {
                     },
                 )?;
                 let id = candidate.ingest(r)?;
-                let view = candidate.rebuild();
+                let view = candidate.rebuild_at(now());
                 ensure!(
                     !view.pending.contains(&id) && !view.disputed.contains(&id),
                     "发布依赖缺失或有撤销争议"
@@ -1357,15 +1393,15 @@ impl Worker {
                     self.allowed(&peer) && records.len() <= ids.len(),
                     "无效记录响应"
                 );
-                let s = self.saved.as_mut().unwrap();
+                let mut candidate = self.saved.as_ref().unwrap().forum.clone();
                 let mut stored = vec![];
                 for r in records {
                     stored.push(record_id(&r)?);
                     ensure!(ids.contains(&record_id(&r)?), "收到未请求的记录");
-                    s.forum.ingest(r)?;
+                    candidate.ingest(r)?;
                 }
-                let missing = s.forum.missing_dependencies();
-                self.refresh();
+                let missing = candidate.missing_dependencies();
+                self.commit_forum(candidate)?;
                 stored.retain(|id| self.shareable(id));
                 self.persist()?;
                 if !stored.is_empty() {
@@ -1432,6 +1468,7 @@ impl Worker {
         loop {
             tokio::select! {
                 _=ticks.tick()=>{
+                    if now()>=self.next_expiry{self.refresh();}
                     match rx.try_recv(){Ok(command)=>{if let Some(raw)=command.raw{let result=match command.request{ForumRequest::ReadExport{hash}=>parse_hash(&hash).and_then(|h|self.read_export_bytes(h)),_=>Err(anyhow::anyhow!("无效原生请求"))};let _=raw.send(result);}else{let result=self.command(command.request,&mut swarm);let _=command.reply.send(result);}},Err(mpsc::TryRecvError::Disconnected)=>break,Err(mpsc::TryRecvError::Empty)=>{}}
                     if last_sync.elapsed()>Duration::from_secs(10){
                         for peer in self.peers.clone(){if !self.requests.values().any(|p|p.peer==peer)&&self.queues.get(&peer).is_none_or(VecDeque::is_empty){self.enqueue(peer,Query::Hello{governance:self.governance()});}}
@@ -1610,6 +1647,79 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t["versions"][0]["body"] == "中文正文"));
+    }
+    #[test]
+    fn bad_batches_never_leave_authorization_view_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin = Keypair::ed25519_from_bytes([1; 32]).unwrap();
+        let member = Keypair::ed25519_from_bytes([2; 32]).unwrap().public();
+        let mut forum = Forum::new([7; 32], admin.public().encode_protobuf()).unwrap();
+        let admission = sign_record(
+            &admin,
+            [7; 32],
+            Action::Governance {
+                sequence: 1,
+                previous: None,
+                change: GovernanceChange::Admit {
+                    member: member.encode_protobuf(),
+                    inviter: admin.public().encode_protobuf(),
+                    expires_at: now() + 3600,
+                },
+            },
+        )
+        .unwrap();
+        let head = forum.ingest(admission).unwrap();
+        let mut w = Worker::new(admin.clone(), [8; 32], dir.path().into()).unwrap();
+        w.saved = Some(Saved {
+            name: "test".into(),
+            forum,
+            cached: BTreeMap::new(),
+            draft: DraftData::default(),
+            entries: vec![],
+        });
+        w.refresh();
+        let revoke = sign_record(
+            &admin,
+            [7; 32],
+            Action::Governance {
+                sequence: 2,
+                previous: Some(head),
+                change: GovernanceChange::Revoke {
+                    member: member.encode_protobuf(),
+                },
+            },
+        )
+        .unwrap();
+        let mut invalid = revoke.clone();
+        invalid.record.nonce[0] ^= 1;
+        assert!(w
+            .apply_governance(vec![revoke.clone(), invalid.clone()])
+            .is_err());
+        assert_eq!(w.saved.as_ref().unwrap().forum.records.len(), 1);
+        assert!(w.allowed(&member.to_peer_id()));
+        let ids = vec![record_id(&revoke).unwrap(), record_id(&invalid).unwrap()];
+        assert!(w
+            .receive(
+                Pending {
+                    peer: admin.public().to_peer_id(),
+                    query: Query::Records { ids }
+                },
+                Response::Records {
+                    records: vec![revoke.clone(), invalid]
+                }
+            )
+            .is_err());
+        assert_eq!(w.saved.as_ref().unwrap().forum.records.len(), 1);
+        assert_eq!(
+            w.allowed(&member.to_peer_id()),
+            w.saved
+                .as_ref()
+                .unwrap()
+                .forum
+                .can_access(&member.encode_protobuf(), now())
+        );
+        w.apply_governance(vec![revoke]).unwrap();
+        assert!(!w.allowed(&member.to_peer_id()));
     }
     #[test]
     fn pending_records_are_not_advertised_or_exported() {
