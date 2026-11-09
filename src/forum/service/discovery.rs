@@ -73,10 +73,14 @@ impl Worker {
         hops: u8,
     ) -> Result<Response> {
         ensure!(hops <= 2, "查询跳数过大");
-        let own = self
-            .saved
-            .as_ref()
-            .is_some_and(|s| s.forum.body(&hash).is_some() || s.cached.contains_key(&hash));
+        let own = self.saved.as_ref().is_some_and(|s| {
+            (s.forum.body(&hash).is_some()
+                && s.forum.records.iter().any(|(id, r)| {
+                    self.shareable(id)
+                        && matches!(r.record.action,Action::Content{body,..} if body==hash)
+                }))
+                || (s.cached.contains_key(&hash) && self.attachment_size(&hash).is_some())
+        });
         let mut nodes = self
             .providers
             .get(&hash)
@@ -235,6 +239,27 @@ mod tests {
             .forum
             .put_body(b"cached".to_vec())
             .unwrap();
+        let record = sign_record(
+            &provider.key,
+            [7; 32],
+            Action::Content {
+                target: None,
+                reply_to: None,
+                parents: vec![],
+                title: "cached".into(),
+                body: hash,
+                attachments: vec![],
+            },
+        )
+        .unwrap();
+        provider
+            .saved
+            .as_mut()
+            .unwrap()
+            .forum
+            .ingest(record)
+            .unwrap();
+        provider.refresh();
         let request_id = [4; 16];
         let answer = middle.find_answer(source, hash, request_id, 2).unwrap();
         assert!(matches!(answer,Response::Found{nodes,..} if nodes.is_empty()));

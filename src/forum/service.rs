@@ -224,6 +224,7 @@ struct Pending {
 }
 struct Worker {
     key: Keypair,
+    _lock: std::fs::File,
     storage_key: [u8; 32],
     path: PathBuf,
     saved: Option<Saved>,
@@ -291,6 +292,12 @@ pub fn parse_hash(text: &str) -> Result<Digest> {
     }
     Ok(out)
 }
+fn attachments_to_pin(forum: &Forum, id: &Digest) -> Vec<Digest> {
+    match &forum.records[id].record.action {
+        Action::Content { attachments, .. } => attachments.iter().map(|a| a.hash).collect(),
+        _ => vec![],
+    }
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -326,9 +333,18 @@ impl Worker {
     fn new(key: Keypair, storage_key: [u8; 32], directory: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&directory)?;
         let path = directory.join("forum.enc");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("forum.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .map_err(|_| anyhow::anyhow!("论坛数据已由另一客户端使用"))?;
         let saved = if path.exists() {
-            let value: Saved =
-                postcard::from_bytes(&super::storage::load_bytes(&path, &storage_key)?)?;
+            let value: Saved = postcard::from_bytes(&zeroize::Zeroizing::new(
+                super::storage::load_bytes(&path, &storage_key)?,
+            ))?;
             Some(Saved {
                 name: value.name,
                 forum: super::storage::validate_snapshot(value.forum)?,
@@ -345,6 +361,7 @@ impl Worker {
             .unwrap_or_default();
         Ok(Self {
             key,
+            _lock: lock,
             storage_key,
             path,
             saved,
@@ -386,7 +403,7 @@ impl Worker {
                 super::storage::save_bytes(
                     &self.path,
                     &self.storage_key,
-                    &postcard::to_allocvec(s)?,
+                    &zeroize::Zeroizing::new(postcard::to_allocvec(s)?),
                 )?;
             }
             self.dirty = false;
@@ -833,6 +850,11 @@ impl Worker {
                     !view.pending.contains(&id) && !view.disputed.contains(&id),
                     "发布依赖缺失或有撤销争议"
                 );
+                for attachment in &attachments_to_pin(&candidate, &id) {
+                    if let Some(c) = s.cached.get_mut(attachment) {
+                        c.pinned = true;
+                    }
+                }
                 s.forum = candidate;
                 s.draft = DraftData::default();
                 self.refresh();
@@ -1002,11 +1024,10 @@ impl Worker {
                 }
             }
             Query::Body { hash } => {
-                let referenced = s
-                    .forum
-                    .records
-                    .values()
-                    .any(|r| matches!(r.record.action,Action::Content{body,..} if body==hash));
+                let referenced = s.forum.records.iter().any(|(id, r)| {
+                    self.shareable(id)
+                        && matches!(r.record.action,Action::Content{body,..} if body==hash)
+                });
                 Response::Body {
                     hash,
                     bytes: if referenced {

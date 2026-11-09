@@ -44,7 +44,9 @@ impl Worker {
             let next = saved
                 .cached
                 .iter()
-                .filter(|(_, c)| !c.pinned)
+                .filter(|(hash, c)| {
+                    !c.pinned && !saved.draft.attachments.iter().any(|a| a.hash == hex(hash))
+                })
                 .min_by_key(|(_, c)| c.used)
                 .map(|(h, c)| (*h, c.size));
             let Some((hash, size)) = next else {
@@ -137,7 +139,7 @@ impl Worker {
         }
         ensure!(total == size, "附件读取不完整");
         let hash: Digest = digest.finalize().into();
-        self.finish_blob(hash, size, true, temp)?;
+        self.finish_blob(hash, size, false, temp)?;
         Ok(json!({"name":name,"size":size,"hash":hex(&hash)}))
     }
     pub(super) fn attachment_size(&self, hash: &Digest) -> Option<u64> {
@@ -145,8 +147,9 @@ impl Worker {
             .as_ref()?
             .forum
             .records
-            .values()
-            .find_map(|r| match &r.record.action {
+            .iter()
+            .filter(|(id, _)| self.shareable(id))
+            .find_map(|(_, r)| match &r.record.action {
                 Action::Content { attachments, .. } => {
                     attachments.iter().find(|a| &a.hash == hash).map(|a| a.size)
                 }
@@ -165,6 +168,10 @@ impl Worker {
         let path = self
             .blob_path(hash)
             .join((offset / CHUNK as u64).to_string());
+        ensure!(
+            std::fs::metadata(&path)?.len() <= CHUNK as u64 + 128,
+            "缓存分块过大"
+        );
         let bytes = super::super::storage::load_bytes(&path, &self.storage_key)?;
         ensure!(
             bytes.len() == (c.size - offset).min(CHUNK as u64) as usize,
@@ -183,6 +190,8 @@ impl Worker {
             .and_then(|s| s.cached.get(&hash))
             .ok_or_else(|| anyhow::anyhow!("附件尚未下载完整"))?
             .size;
+        ensure!(size <= MAX_ATTACHMENT_BYTES, "附件大小无效");
+        let mut verified = zeroize::Zeroizing::new(Vec::with_capacity(size as usize));
         let mut digest = Sha256::new();
         let mut offset = 0;
         while offset < size {
@@ -190,11 +199,12 @@ impl Worker {
                 .read_chunk(&hash, offset)?
                 .ok_or_else(|| anyhow::anyhow!("附件缓存缺失"))?;
             digest.update(&bytes);
-            file.write_all(&bytes)?;
+            verified.extend_from_slice(&bytes);
             offset += bytes.len() as u64;
             bytes.zeroize();
         }
         ensure!(Digest::from(digest.finalize()) == hash, "缓存附件校验失败");
+        file.write_all(&verified)?;
         file.sync_all()?;
         self.saved
             .as_mut()
@@ -312,5 +322,52 @@ impl Worker {
             self.enqueue(peer, Query::Chunk { hash, offset });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn corrupt_cached_attachment_never_reaches_export_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker = Worker::new(
+            Keypair::ed25519_from_bytes([1; 32]).unwrap(),
+            [9; 32],
+            dir.path().into(),
+        )
+        .unwrap();
+        worker.saved = Some(Saved {
+            name: "test".into(),
+            forum: Forum::new([7; 32], worker.key.public().encode_protobuf()).unwrap(),
+            cached: BTreeMap::new(),
+            draft: DraftData::default(),
+            entries: vec![],
+        });
+        worker.refresh();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"original").unwrap();
+        let attachment = worker
+            .attach_file("source".into(), std::fs::File::open(source).unwrap())
+            .unwrap();
+        let hash = parse_hash(attachment["hash"].as_str().unwrap()).unwrap();
+        super::super::super::storage::save_bytes(
+            &worker.blob_path(&hash).join("0"),
+            &worker.storage_key,
+            b"tampered",
+        )
+        .unwrap();
+        let output = dir.path().join("output");
+        std::fs::write(&output, b"keep").unwrap();
+        assert!(worker
+            .export_file(
+                hash,
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&output)
+                    .unwrap()
+            )
+            .is_err());
+        assert_eq!(std::fs::read(output).unwrap(), b"keep");
     }
 }
