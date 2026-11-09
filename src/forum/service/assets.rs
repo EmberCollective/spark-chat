@@ -316,6 +316,14 @@ impl Worker {
             );
             self.finish_blob(hash, d.size, false, d.temporary)?;
             self.wanted.remove(&hash);
+            self.persist()?;
+            self.enqueue(
+                peer,
+                Query::Stored {
+                    records: vec![],
+                    objects: vec![hash],
+                },
+            );
             self.status = "附件已校验并缓存，可以保存".into();
         } else {
             let offset = d.received;

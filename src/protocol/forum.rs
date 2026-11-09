@@ -75,6 +75,14 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Query {
+    Offer {
+        record: SignedRecord,
+        body: Vec<u8>,
+    },
+    Stored {
+        records: Vec<Digest>,
+        objects: Vec<Digest>,
+    },
     Neighbors,
     Find {
         hash: Digest,
@@ -100,6 +108,11 @@ pub enum Query {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
+    Stored,
+    Accepted {
+        record: Digest,
+        body: Digest,
+    },
     Neighbors {
         nodes: Vec<NodeAddress>,
     },

@@ -2,6 +2,7 @@
 use super::*;
 mod assets;
 mod discovery;
+mod replication;
 pub use assets::AttachmentInput;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures::StreamExt;
@@ -252,6 +253,8 @@ struct Worker {
     providers: BTreeMap<Digest, (Instant, Vec<NodeAddress>)>,
     last_find: Instant,
     wanted: BTreeMap<Digest, Instant>,
+    replicas: BTreeMap<Digest, BTreeSet<PeerId>>,
+    replication_downloads: VecDeque<(PeerId, Digest)>,
 }
 
 impl Drop for Worker {
@@ -389,6 +392,8 @@ impl Worker {
             providers: BTreeMap::new(),
             last_find: Instant::now(),
             wanted: BTreeMap::new(),
+            replicas: BTreeMap::new(),
+            replication_downloads: VecDeque::new(),
         })
     }
     fn refresh(&mut self) {
@@ -500,7 +505,7 @@ impl Worker {
                         if target.unwrap_or(*id) != topic.root {
                             continue;
                         }
-                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":if topic.heads.contains(id)||self.shown_bodies.contains(body){s.forum.body(body).filter(|b|{if b.len()<=body_budget{body_budget-=b.len();true}else{false}}).and_then(|b|std::str::from_utf8(b).ok())}else{None},"body_hash":hex(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash)})).collect::<Vec<_>>()}));
+                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":if topic.heads.contains(id)||self.shown_bodies.contains(body){s.forum.body(body).filter(|b|{if b.len()<=body_budget{body_budget-=b.len();true}else{false}}).and_then(|b|std::str::from_utf8(b).ok())}else{None},"body_hash":hex(body),"record_copies":1+self.remote_copies(id),"body_copies":usize::from(s.forum.body(body).is_some())+self.remote_copies(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash),"copies":usize::from(s.cached.contains_key(&a.hash))+self.remote_copies(&a.hash)})).collect::<Vec<_>>()}));
                     }
                 }
                 let title = topic
@@ -517,7 +522,7 @@ impl Worker {
                 topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body(&topic.root).ok().flatten()}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now()})).collect::<Vec<_>>(),"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
     }
     fn apply_governance(&mut self, records: Vec<SignedRecord>) -> Result<()> {
         ensure!(records.len() <= 256, "治理记录过多");
@@ -859,6 +864,9 @@ impl Worker {
                 s.draft = DraftData::default();
                 self.refresh();
                 self.status = "已在本机保存，正在同步".into();
+                if let Some(peer) = self.peers.iter().next().copied() {
+                    self.offer_local(peer);
+                }
             }
             ForumRequest::Fetch { hash } => {
                 let hash = parse_hash(&hash)?;
@@ -923,6 +931,17 @@ impl Worker {
                 continue;
             }
             if let Some(query) = self.queues.get_mut(&peer).and_then(VecDeque::pop_front) {
+                self.credit = (self.credit + self.credit_at.elapsed().as_secs_f64() * 500_000.0)
+                    .min(500_000.0);
+                self.credit_at = Instant::now();
+                let size = postcard::to_allocvec(&query)
+                    .map(|b| b.len())
+                    .unwrap_or(usize::MAX);
+                if size as f64 > self.credit {
+                    self.queues.entry(peer).or_default().push_front(query);
+                    continue;
+                }
+                self.credit -= size as f64;
                 let id = swarm.behaviour_mut().send_request(
                     &peer,
                     Request {
@@ -962,6 +981,14 @@ impl Worker {
         ensure!(self.allowed(&peer), "成员资格无效");
         let s = self.saved.as_ref().unwrap();
         Ok(match request.query {
+            Query::Offer { record, body } => self.accept_offer(peer, record, body)?,
+            Query::Stored { records, objects } => {
+                ensure!(records.len() <= 8 && objects.len() <= 5, "副本确认过大");
+                for id in records.into_iter().chain(objects) {
+                    self.confirm_copy(peer, id);
+                }
+                Response::Stored
+            }
             Query::Neighbors => {
                 let mut nodes: Vec<_> = self
                     .addresses
@@ -1051,6 +1078,22 @@ impl Worker {
             anyhow::bail!("对方拒绝论坛访问，请检查批准及撤销状态");
         }
         match (pending.query, response) {
+            (Query::Stored { .. }, Response::Stored) => {}
+            (
+                Query::Offer { record, body },
+                Response::Accepted {
+                    record: id,
+                    body: hash,
+                },
+            ) => {
+                ensure!(
+                    self.allowed(&peer) && record_id(&record)? == id && content_id(&body) == hash,
+                    "副本确认不匹配"
+                );
+                self.confirm_copy(peer, id);
+                self.confirm_copy(peer, hash);
+                self.status = "正文已取得在线节点落盘确认".into();
+            }
             (Query::Neighbors, Response::Neighbors { nodes }) => {
                 ensure!(self.allowed(&peer) && nodes.len() <= 3, "邻居列表无效");
                 for node in nodes {
@@ -1105,6 +1148,7 @@ impl Worker {
                 self.enqueue(peer, Query::Neighbors);
                 self.enqueue(peer, Query::Inventory { after: None });
                 self.fetch_wanted(peer);
+                self.offer_local(peer);
             }
             (Query::Inventory { after }, Response::Inventory { ids, more }) => {
                 ensure!(
@@ -1140,12 +1184,25 @@ impl Worker {
                     "无效记录响应"
                 );
                 let s = self.saved.as_mut().unwrap();
+                let mut stored = vec![];
                 for r in records {
+                    stored.push(record_id(&r)?);
                     ensure!(ids.contains(&record_id(&r)?), "收到未请求的记录");
                     s.forum.ingest(r)?;
                 }
                 let missing = s.forum.missing_dependencies();
                 self.refresh();
+                stored.retain(|id| self.shareable(id));
+                self.persist()?;
+                if !stored.is_empty() {
+                    self.enqueue(
+                        peer,
+                        Query::Stored {
+                            records: stored,
+                            objects: vec![],
+                        },
+                    );
+                }
                 for chunk in missing.chunks(8).take(4) {
                     self.enqueue(
                         peer,
@@ -1169,6 +1226,14 @@ impl Worker {
                     self.dirty = true;
                     self.status = "正文已校验并缓存".into();
                     self.wanted.remove(&hash);
+                    self.persist()?;
+                    self.enqueue(
+                        peer,
+                        Query::Stored {
+                            records: vec![],
+                            objects: vec![hash],
+                        },
+                    );
                 }
             }
             _ => anyhow::bail!("响应类型不匹配"),
@@ -1202,6 +1267,7 @@ impl Worker {
                     let expired:Vec<_>=self.authenticating.iter().filter(|(_,t)|t.elapsed()>Duration::from_secs(5)).map(|(p,_)|*p).chain(self.peers.iter().filter(|p|!self.allowed(p)).copied()).collect();
                     for peer in expired {let _=swarm.disconnect_peer_id(peer);self.authenticating.remove(&peer);self.peers.remove(&peer);self.queues.remove(&peer);}
                     self.downloads.retain(|_,d|d.updated.elapsed()<Duration::from_secs(30));
+                    self.replication_tick();
                     self.discovery_tick(&mut swarm);
                     self.next(&mut swarm);
                 }
@@ -1295,6 +1361,7 @@ mod tests {
         .unwrap();
         b.handle(ForumRequest::Sync).unwrap();
         wait(|| state(&b)["topics"].as_array().unwrap().len() == 1);
+        wait(||state(&a)["topics"][0]["versions"][0]["body_copies"].as_u64().unwrap()>=2);
         let hash = state(&b)["topics"][0]["versions"][0]["body_hash"]
             .as_str()
             .unwrap()
