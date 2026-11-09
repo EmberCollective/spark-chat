@@ -31,6 +31,20 @@ pub enum GovernanceChange {
         target: Digest,
         hidden: bool,
     },
+    Category {
+        id: String,
+        title: String,
+    },
+    AssignCategory {
+        target: Digest,
+        category: String,
+    },
+    /// Frozen content heads explicitly define the accepted history, independent of clocks.
+    Lock {
+        target: Digest,
+        locked: bool,
+        heads: Vec<Digest>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +63,10 @@ pub enum Action {
         title: String,
         body: Digest,
         attachments: Vec<Attachment>,
+    },
+    Report {
+        target: Digest,
+        reason: String,
     },
 }
 

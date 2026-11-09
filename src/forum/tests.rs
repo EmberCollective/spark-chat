@@ -272,3 +272,161 @@ fn pending_bytes_stop_large_unknown_author_records_without_blocking_members() {
     let id = f.ingest(valid).unwrap();
     assert!(!f.rebuild().pending.contains(&id));
 }
+
+#[test]
+fn categories_reports_and_lock_converge_without_clocks() {
+    let mut f = fixture();
+    let original = post(&mut f, 2, None, vec![], "原文");
+    let root = f.ingest(original).unwrap();
+    let reply_body = f.put_body(b"reply".to_vec()).unwrap();
+    let reply = f
+        .ingest(
+            sign_record(
+                &key(3),
+                f.network(),
+                Action::Content {
+                    target: None,
+                    reply_to: Some(root),
+                    parents: vec![],
+                    title: String::new(),
+                    body: reply_body,
+                    attachments: vec![],
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let category = gov(
+        &f,
+        GovernanceChange::Category {
+            id: "study".into(),
+            title: "学习".into(),
+        },
+    );
+    f.ingest(category).unwrap();
+    let assign = gov(
+        &f,
+        GovernanceChange::AssignCategory {
+            target: root,
+            category: "study".into(),
+        },
+    );
+    f.ingest(assign).unwrap();
+    let report = sign_record(
+        &key(3),
+        f.network(),
+        Action::Report {
+            target: root,
+            reason: "需管理员核查".into(),
+        },
+    )
+    .unwrap();
+    let report_id = f.ingest(report).unwrap();
+    let view = f.rebuild();
+    assert_eq!(view.reports[0].id, report_id);
+    assert!(!view.members[&pk(2)].revoked);
+    assert_eq!(
+        view.topics
+            .iter()
+            .find(|t| t.root == root)
+            .unwrap()
+            .category,
+        "study"
+    );
+    let concurrent = post(&mut f, 2, Some(root), vec![root], "分区新增修改");
+    let concurrent_id = record_id(&concurrent).unwrap();
+    let mut heads = vec![root, reply];
+    heads.sort();
+    let lock = gov(
+        &f,
+        GovernanceChange::Lock {
+            target: root,
+            locked: true,
+            heads,
+        },
+    );
+    let mut a = f.clone();
+    let mut b = f.clone();
+    a.ingest(concurrent.clone()).unwrap();
+    a.ingest(lock.clone()).unwrap();
+    b.ingest(lock).unwrap();
+    b.ingest(concurrent).unwrap();
+    assert_eq!(a.rebuild().topics, b.rebuild().topics);
+    let view = a.rebuild();
+    assert!(view.disputed.contains(&concurrent_id));
+    assert_eq!(view.topics.len(), 2, "已有回复保留");
+    assert!(view.topics.iter().all(|t| t.locked));
+    assert_eq!(
+        view.topics.iter().find(|t| t.root == root).unwrap().heads,
+        vec![root]
+    );
+    let new_reply = a
+        .ingest(
+            sign_record(
+                &key(3),
+                a.network(),
+                Action::Content {
+                    target: None,
+                    reply_to: Some(root),
+                    parents: vec![],
+                    title: String::new(),
+                    body: reply_body,
+                    attachments: vec![],
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(a.rebuild().disputed.contains(&new_reply));
+    let unlock = gov(
+        &a,
+        GovernanceChange::Lock {
+            target: root,
+            locked: false,
+            heads: vec![],
+        },
+    );
+    a.ingest(unlock).unwrap();
+    assert!(!a.rebuild().topics.iter().any(|t| t.locked));
+    assert!(!a.rebuild().disputed.contains(&concurrent_id));
+}
+
+#[test]
+fn report_and_category_permissions_reject_forgery_and_unknown_targets() {
+    let mut f = fixture();
+    let forged = sign_record(
+        &key(2),
+        f.network(),
+        Action::Governance {
+            sequence: 6,
+            previous: f.rebuild().governance_head,
+            change: GovernanceChange::Category {
+                id: "evil".into(),
+                title: "越权".into(),
+            },
+        },
+    )
+    .unwrap();
+    assert!(f.ingest(forged).is_err());
+    let unknown = sign_record(
+        &key(2),
+        f.network(),
+        Action::Report {
+            target: [42; 32],
+            reason: "待补目标".into(),
+        },
+    )
+    .unwrap();
+    let id = f.ingest(unknown).unwrap();
+    assert!(f.rebuild().pending.contains(&id));
+    assert!(f.rebuild().reports.is_empty());
+    assert!(sign_record(
+        &key(2),
+        f.network(),
+        Action::Report {
+            target: [42; 32],
+            reason: String::new()
+        }
+    )
+    .is_err());
+}

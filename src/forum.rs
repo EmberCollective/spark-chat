@@ -148,7 +148,40 @@ fn validate(signed: &SignedRecord, network: Digest) -> Result<()> {
                     );
                 }
                 GovernanceChange::Moderate { .. } => {}
+                GovernanceChange::Category { id, title } => {
+                    ensure!(
+                        !id.is_empty()
+                            && id.len() <= 32
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                        "分类编号无效"
+                    );
+                    ensure!(
+                        !title.trim().is_empty()
+                            && title.chars().count() <= 24
+                            && !title.chars().any(char::is_control),
+                        "分类名称无效"
+                    );
+                }
+                GovernanceChange::AssignCategory { category, .. } => {
+                    ensure!(!category.is_empty() && category.len() <= 32, "分类编号无效");
+                }
+                GovernanceChange::Lock { locked, heads, .. } => {
+                    ensure!(
+                        heads.len() <= 512
+                            && heads.windows(2).all(|p| p[0] < p[1])
+                            && (*locked != heads.is_empty()),
+                        "锁定必须引用有序的当前版本，解锁不携带版本"
+                    );
+                }
             }
+        }
+        Action::Report { reason, .. } => {
+            ensure!(
+                !reason.trim().is_empty() && reason.chars().count() <= 500,
+                "举报理由须为 1 至 500 字"
+            );
         }
     }
     Ok(())
@@ -166,6 +199,15 @@ pub struct Topic {
     pub reply_to: Option<Digest>,
     pub heads: Vec<Digest>,
     pub hidden: bool,
+    pub locked: bool,
+    pub category: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Report {
+    pub id: Digest,
+    pub target: Digest,
+    pub author: Vec<u8>,
+    pub reason: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct ForumView {
@@ -174,6 +216,8 @@ pub struct ForumView {
     pub governance_conflict: bool,
     pub members: BTreeMap<Vec<u8>, Member>,
     pub topics: Vec<Topic>,
+    pub categories: BTreeMap<String, String>,
+    pub reports: Vec<Report>,
     pub pending: Vec<Digest>,
     pub disputed: Vec<Digest>,
     pub invalid: Vec<Digest>,
@@ -321,6 +365,9 @@ impl Forum {
         );
         let mut confirmed = BTreeSet::new();
         let mut hidden = BTreeMap::new();
+        view.categories.insert("general".into(), "综合".into());
+        let mut categories = BTreeMap::new();
+        let mut locks: BTreeMap<Digest, BTreeSet<Digest>> = BTreeMap::new();
         let mut applied = BTreeSet::new();
         loop {
             let candidates: Vec<_> = self.records.iter().filter(|(_, r)| matches!(&r.record.action,
@@ -374,6 +421,46 @@ impl Forum {
                         .all(|id| self.collect_valid(*id, &view.members, &mut all, 0));
                     if ok {
                         confirmed.extend(all);
+                    }
+                    ok
+                }
+                GovernanceChange::Category { id, title } => {
+                    view.categories.insert(id.clone(), title.clone());
+                    true
+                }
+                GovernanceChange::AssignCategory { target, category } => {
+                    if view.categories.contains_key(category)
+                        && self.records.get(target).is_some_and(|r| {
+                            matches!(
+                                r.record.action,
+                                Action::Content {
+                                    target: None,
+                                    reply_to: None,
+                                    ..
+                                }
+                            )
+                        })
+                    {
+                        categories.insert(*target, category.clone());
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GovernanceChange::Lock {
+                    target,
+                    locked,
+                    heads,
+                } => {
+                    let mut accepted = BTreeSet::new();
+                    let ok = self.records.get(target).is_some_and(|r| matches!(r.record.action, Action::Content { target: None, reply_to: None, .. }))
+                        && heads.iter().all(|id| self.records.get(id).is_some_and(|r| matches!(r.record.action, Action::Content { target: t, reply_to, .. } if t.unwrap_or(*id) == *target || reply_to == Some(*target) || t.is_some_and(|root| self.records.get(&root).is_some_and(|root_record| matches!(root_record.record.action, Action::Content { reply_to: Some(topic), .. } if topic == *target))))) && self.collect_valid(*id, &view.members, &mut accepted, 0));
+                    if ok {
+                        if *locked {
+                            locks.insert(*target, accepted);
+                        } else {
+                            locks.remove(target);
+                        }
                     }
                     ok
                 }
@@ -446,7 +533,20 @@ impl Forum {
                 if depth > MAX_DEPTH {
                     continue;
                 }
-                if view.governance_conflict
+                let parent_topic = match &self.records[&root].record.action {
+                    Action::Content { reply_to, .. } => *reply_to,
+                    _ => None,
+                };
+                let locked_out = locks
+                    .get(&root)
+                    .is_some_and(|accepted| !accepted.contains(id))
+                    || parent_topic.is_some_and(|topic| {
+                        locks
+                            .get(&topic)
+                            .is_some_and(|accepted| !accepted.contains(id))
+                    });
+                if locked_out
+                    || view.governance_conflict
                     || (view.members[&signed.record.author].revoked && !confirmed.contains(id))
                     || parents.iter().any(|p| disputed.contains(p))
                     || reply_to.is_some_and(|r| disputed.contains(&r))
@@ -473,6 +573,12 @@ impl Forum {
                     root: *root,
                     reply_to,
                     heads: Vec::new(),
+                    locked: locks.contains_key(root)
+                        || reply_to.is_some_and(|r| locks.contains_key(&r)),
+                    category: categories
+                        .get(&reply_to.unwrap_or(*root))
+                        .cloned()
+                        .unwrap_or_else(|| "general".into()),
                     hidden: hidden.get(root).copied().unwrap_or(false)
                         || reply_to.is_some_and(|r| hidden.get(&r).copied().unwrap_or(false)),
                 }
@@ -492,6 +598,24 @@ impl Forum {
         }
         for (id, signed) in &self.records {
             match signed.record.action {
+                Action::Report { target, ref reason } => {
+                    if !valid.contains_key(&target)
+                        || !view.members.contains_key(&signed.record.author)
+                    {
+                        view.pending.push(*id);
+                    } else if view.members[&signed.record.author].revoked
+                        || view.governance_conflict
+                    {
+                        disputed.insert(*id);
+                    } else {
+                        view.reports.push(Report {
+                            id: *id,
+                            target,
+                            author: signed.record.author.clone(),
+                            reason: reason.clone(),
+                        });
+                    }
+                }
                 Action::Content { .. } if !valid.contains_key(id) => view.pending.push(*id),
                 Action::Governance { .. } if !applied.contains(id) => view.pending.push(*id),
                 _ => {}
@@ -580,6 +704,7 @@ impl Forum {
 
 fn dependencies(action: &Action) -> Vec<Digest> {
     match action {
+        Action::Report { target, .. } => vec![*target],
         Action::Content {
             target,
             reply_to,
@@ -598,7 +723,11 @@ fn dependencies(action: &Action) -> Vec<Digest> {
             .copied()
             .chain(match change {
                 GovernanceChange::Checkpoint { records } => records.clone(),
-                GovernanceChange::Moderate { target, .. } => vec![*target],
+                GovernanceChange::Moderate { target, .. }
+                | GovernanceChange::AssignCategory { target, .. } => vec![*target],
+                GovernanceChange::Lock { target, heads, .. } => std::iter::once(*target)
+                    .chain(heads.iter().copied())
+                    .collect(),
                 _ => vec![],
             })
             .collect(),
