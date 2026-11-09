@@ -14,7 +14,7 @@
   const initial = () => ({ vault_created:true, my_id:"self", peer_id:active, active_session:active,
     position:"测试网络", position_kind:"campus", connected:true, revision:0, history:peers[active], files:files[active], images:images[active],
     sessions:Object.keys(peers).map(id=>({id,connected:true,history:peers[id],files:files[id],images:images[id]})) });
-  const forum = {joined:true,admin:true,categories:{general:"综合",study:"学习"},name:"测试论坛",own_public:"public-self",peers:2,pending:0,disputed:0,members:[],topics:[
+  const forum = {current_community:"campus",communities:[{id:"campus",name:"测试论坛",admin:true},{id:"tech",name:"技术社",admin:false}],nickname:"",nicknames:{},joined:true,admin:true,categories:{general:"综合",study:"学习"},name:"测试论坛",own_public:"public-self",peers:2,pending:0,disputed:0,members:[{id:"public-self",active:true,status:"active",inviter:"public-self"}],topics:[
     {id:"root",title:"<img src=x onerror=alert(1)>",author:"author",reply_to:null,hidden:false,heads:["v2","v3"],versions:[
       {id:"v1",author:"author",body:"原文",body_hash:"h1",attachments:[]},
       {id:"v2",author:"bob",body:"修改甲",body_hash:"h2",attachments:[]},
@@ -39,8 +39,11 @@
         return result;
       }
       case "image_preview": return png;
+      case "forum_attach": return {attachment:{hash:"test-attachment",name:"测试附件.txt",size:12}};
       case "forum": {
         const command=request.command;
+        if(command.kind==="community_select"){forum.current_community=command.id;forum.admin=command.id==="campus";forum.name=forum.admin?"测试论坛":"技术社";}
+        if(command.kind==="nickname"){forum.nickname=command.nickname;forum.nicknames[forum.own_public]=command.nickname;}
         if(command.kind==="lock") topics.find(t=>t.id===command.target).locked=command.locked;
         if(command.kind==="categorize") topics.find(t=>t.id===command.target).category=command.category;
         if(command.kind==="search") return {search:{query:command.query,offset:command.offset,total:1,results:[{topic_id:"third",title:"主题 third",excerpt:"跨页命中"}]}};
@@ -90,6 +93,20 @@
       $("forum-open").click();await tick();
       check(!$("forum-panel").hidden&&$("workspace").hidden,"论坛独立入口");
       check(!document.querySelector("#forum-topics img"),"论坛标题不能注入HTML");
+      const visibleViews=()=>[...document.querySelectorAll('[id^="forum-view-"]')].filter(el=>!el.hidden);
+      check(visibleViews().length===1&&visibleViews()[0].id==="forum-view-home","论坛默认只显示独立主题首页");
+      document.querySelector('[data-forum-page="network"]').click();
+      check(visibleViews().length===1&&visibleViews()[0].id==="forum-view-network","网络设置不与主题列表堆叠");
+      document.querySelector('[data-forum-page="admin"]').click();
+      document.querySelector('[data-forum-admin-tab="boards"]').click();
+      check(!$("forum-admin-boards").hidden&&$("forum-admin-members").hidden,"管理后台按任务拆分子页");
+      document.querySelector('[data-forum-page="home"]').click();await tick();
+      $("forum-new").click();
+      check(visibleViews().length===1&&visibleViews()[0].id==="forum-view-editor","发布主题使用独立编辑页面");
+      $("forum-attach").click();await tick();
+      check(calls.some(c=>c.action==="forum_attach"&&c.community_id==="campus"),"附件选择绑定发起时的社区");
+      $("forum-body").value="保留的草稿";$("forum-cancel").click();await tick();
+      check($("forum-body").value==="保留的草稿"&&calls.some(c=>c.action==="forum"&&c.command.kind==="draft"&&c.command.body==="保留的草稿"),"退出编辑保存输入而不丢弃草稿");
       const pageButton=(container,label)=>[...container.querySelectorAll("button")].find(button=>button.textContent===label);
       check($("forum-topics").querySelectorAll(".forum-topic").length===2,"主题列表只展示当前页");
       pageButton($("forum-topics"),"下一页").click();await tick();
@@ -119,6 +136,12 @@
       check(!calls.some(c=>c.action==="open_link"),"展示外链不会自动打开或请求外部网站");
       $("forum-detail").querySelector("a").click();await tick();
       check(calls.filter(c=>c.action==="open_link").length===1&&calls.find(c=>c.action==="open_link").url==="https://example.com/resource","外链仅在点击时交给原生浏览器");
+      $("forum-profile-open").click();$("forum-nickname").value="我的昵称";
+      $("forum-profile-form").dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}));await tick();
+      check(calls.some(c=>c.action==="forum"&&c.command.kind==="nickname"&&c.command.nickname==="我的昵称"&&c.command.community_id==="campus")&&!$("forum-profile-dialog").open,"昵称通过当前社区签名接口保存");
+      [...$("forum-community-list").querySelectorAll("button")].find(b=>b.textContent.includes("技术社")).click();await tick();
+      check(calls.some(c=>c.action==="forum"&&c.command.kind==="community_select"&&c.command.id==="tech")&&$("community-current").textContent==="技术社","社区切换使用真实目录接口");
+      check([...document.querySelectorAll('[data-forum-page="admin"]')].every(el=>el.hidden),"普通成员不显示当前社区管理入口");
       $("forum-close").click();
       files["peer-bob"]=[{id:"pending",name:"后台文件",outgoing:false,complete:false,accepted:false,failed:""}];
       $("lock").click();await tick();
