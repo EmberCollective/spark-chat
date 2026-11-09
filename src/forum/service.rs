@@ -1,5 +1,7 @@
 //! Independent forum worker. All mutable state and disk writes have one owner.
 use super::*;
+mod assets;
+pub use assets::AttachmentInput;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures::StreamExt;
 use libp2p::{
@@ -21,6 +23,20 @@ use zeroize::Zeroize;
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ForumRequest {
     State,
+    #[serde(skip)]
+    Attach {
+        name: String,
+        file: std::fs::File,
+    },
+    #[serde(skip)]
+    Export {
+        hash: String,
+        file: std::fs::File,
+    },
+    #[serde(skip)]
+    Preview {
+        hash: String,
+    },
     Create {
         name: String,
     },
@@ -58,6 +74,8 @@ pub enum ForumRequest {
         parents: Vec<String>,
         title: String,
         body: String,
+        #[serde(default)]
+        attachments: Vec<AttachmentInput>,
     },
     Fetch {
         hash: String,
@@ -81,6 +99,17 @@ impl Drop for ForumService {
     }
 }
 impl ForumService {
+    pub fn attach(&self, name: String, file: std::fs::File) -> Result<Value> {
+        self.handle(ForumRequest::Attach { name, file })
+    }
+    /// The caller supplies a temporary ReceiveTarget and commits only on success.
+    pub fn export(&self, hash: String, file: std::fs::File) -> Result<Value> {
+        self.handle(ForumRequest::Export { hash, file })
+    }
+    pub fn read_preview(&self, hash: String) -> Result<Value> {
+        self.handle(ForumRequest::Preview { hash })
+    }
+
     pub fn start(seed: [u8; 32], storage_key: [u8; 32], directory: PathBuf) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel(16);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -143,6 +172,7 @@ impl ForumService {
 struct Saved {
     name: String,
     forum: Forum,
+    cached: BTreeMap<Digest, assets::Cached>,
 }
 #[derive(Serialize, Deserialize)]
 struct Invitation {
@@ -176,6 +206,10 @@ struct Worker {
     rates: HashMap<PeerId, (Instant, u32)>,
     dirty: bool,
     status: String,
+    downloads: BTreeMap<Digest, assets::Download>,
+    credit: f64,
+    credit_at: Instant,
+    delayed: HashMap<PeerId, Instant>,
 }
 
 impl Drop for Worker {
@@ -255,6 +289,7 @@ impl Worker {
             Some(Saved {
                 name: value.name,
                 forum: super::storage::validate_snapshot(value.forum)?,
+                cached: value.cached,
             })
         } else {
             None
@@ -277,6 +312,10 @@ impl Worker {
             rates: HashMap::new(),
             dirty: false,
             status: String::new(),
+            downloads: BTreeMap::new(),
+            credit: 500_000.0,
+            credit_at: Instant::now(),
+            delayed: HashMap::new(),
         })
     }
     fn refresh(&mut self) {
@@ -345,7 +384,7 @@ impl Worker {
                         if target.unwrap_or(*id) != topic.root {
                             continue;
                         }
-                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":s.forum.body(body).and_then(|b|std::str::from_utf8(b).ok()),"body_hash":hex(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash)})).collect::<Vec<_>>()}));
+                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":s.forum.body(body).and_then(|b|std::str::from_utf8(b).ok()),"body_hash":hex(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash)})).collect::<Vec<_>>()}));
                     }
                 }
                 let title = topic
@@ -432,8 +471,18 @@ impl Worker {
     }
     fn command(&mut self, request: ForumRequest, swarm: &mut super::wire::Swarm) -> Result<Value> {
         let mut code = None;
+        let mut attachment = None;
         match request {
             ForumRequest::State => {}
+            ForumRequest::Attach { name, file } => {
+                attachment = Some(self.attach_file(name, file)?);
+            }
+            ForumRequest::Export { hash, file } => {
+                self.export_file(parse_hash(&hash)?, file)?;
+            }
+            ForumRequest::Preview { hash } => {
+                return self.preview(parse_hash(&hash)?);
+            }
             ForumRequest::Create { name } => {
                 ensure!(self.saved.is_none(), "已经加入论坛，不能覆盖本地论坛");
                 ensure!(
@@ -445,6 +494,7 @@ impl Worker {
                 self.saved = Some(Saved {
                     name,
                     forum: Forum::new(network, self.key.public().encode_protobuf())?,
+                    cached: BTreeMap::new(),
                 });
                 self.refresh();
             }
@@ -472,6 +522,7 @@ impl Worker {
                 self.saved = Some(Saved {
                     name: invite.name,
                     forum,
+                    cached: BTreeMap::new(),
                 });
                 self.refresh();
             }
@@ -558,6 +609,7 @@ impl Worker {
                 parents,
                 title,
                 body,
+                attachments,
             } => {
                 ensure!(
                     self.allowed(&self.key.public().to_peer_id()),
@@ -573,6 +625,21 @@ impl Worker {
                 let s = self.saved.as_mut().unwrap();
                 let mut candidate = s.forum.clone();
                 let body = candidate.put_body(body.into_bytes())?;
+                let attachments = attachments
+                    .into_iter()
+                    .map(|a| {
+                        let hash = parse_hash(&a.hash)?;
+                        ensure!(
+                            s.cached.get(&hash).is_some_and(|c| c.size == a.size),
+                            "请先上传完整附件"
+                        );
+                        Ok(Attachment {
+                            name: a.name,
+                            size: a.size,
+                            hash,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let r = sign_record(
                     &self.key,
                     candidate.network,
@@ -582,7 +649,7 @@ impl Worker {
                         parents,
                         title,
                         body,
-                        attachments: vec![],
+                        attachments,
                     },
                 )?;
                 let id = candidate.ingest(r)?;
@@ -597,8 +664,12 @@ impl Worker {
             }
             ForumRequest::Fetch { hash } => {
                 let hash = parse_hash(&hash)?;
-                for peer in self.peers.clone() {
-                    self.enqueue(peer, Query::Body { hash });
+                if self.attachment_size(&hash).is_some() {
+                    self.start_download(hash)?;
+                } else {
+                    for peer in self.peers.clone().into_iter().take(3) {
+                        self.enqueue(peer, Query::Body { hash });
+                    }
                 }
             }
             ForumRequest::Sync => {
@@ -616,7 +687,7 @@ impl Worker {
         if code.is_none() && self.listening && !self.listen.is_empty() {
             code = Some(self.entry()?);
         }
-        Ok(json!({"state":self.state(),"code":code}))
+        Ok(json!({"state":self.state(),"code":code,"attachment":attachment}))
     }
     fn enqueue(&mut self, peer: PeerId, query: Query) {
         let queue = self.queues.entry(peer).or_default();
@@ -628,6 +699,13 @@ impl Worker {
         let Some(s) = &self.saved else { return };
         let network = s.forum.network;
         for peer in self.peers.clone() {
+            if self
+                .delayed
+                .get(&peer)
+                .is_some_and(|until| *until > Instant::now())
+            {
+                continue;
+            }
             if self.requests.values().any(|p| p.peer == peer) {
                 continue;
             }
@@ -662,6 +740,17 @@ impl Worker {
         ensure!(self.allowed(&peer), "成员资格无效");
         let s = self.saved.as_ref().unwrap();
         Ok(match request.query {
+            Query::Chunk { hash, offset } => {
+                let total = self
+                    .attachment_size(&hash)
+                    .ok_or_else(|| anyhow::anyhow!("附件未被索引引用"))?;
+                Response::Chunk {
+                    hash,
+                    offset,
+                    total,
+                    bytes: self.read_chunk(&hash, offset)?,
+                }
+            }
             Query::Hello { .. } => Response::Hello {
                 governance: self.governance(),
             },
@@ -708,10 +797,31 @@ impl Worker {
     }
     fn receive(&mut self, pending: Pending, response: Response) -> Result<()> {
         let peer = pending.peer;
+        if matches!(response, Response::Busy) {
+            self.delayed
+                .insert(peer, Instant::now() + Duration::from_millis(500));
+            self.enqueue(peer, pending.query);
+            return Ok(());
+        }
         if matches!(response, Response::Denied) {
             anyhow::bail!("对方拒绝论坛访问，请检查批准及撤销状态");
         }
         match (pending.query, response) {
+            (
+                Query::Chunk { hash, offset },
+                Response::Chunk {
+                    hash: received,
+                    offset: received_offset,
+                    total,
+                    bytes,
+                },
+            ) => {
+                ensure!(
+                    hash == received && offset == received_offset,
+                    "未请求的附件分块"
+                );
+                self.receive_chunk(peer, hash, offset, total, bytes)?;
+            }
             (Query::Hello { .. }, Response::Hello { governance }) => {
                 self.apply_governance(governance)?;
                 ensure!(self.allowed(&peer), "对方不是有效成员");
@@ -798,6 +908,7 @@ impl Worker {
                         last_sync=Instant::now();
                     }
                     if self.dirty&&last_save.elapsed()>Duration::from_secs(1){if let Err(e)=self.persist(){self.status=format!("保存失败：{e}");}last_save=Instant::now();}
+                    self.downloads.retain(|_,d|d.updated.elapsed()<Duration::from_secs(30));
                     self.next(&mut swarm);
                 }
                 event=swarm.select_next_some()=>match event{
@@ -809,7 +920,11 @@ impl Worker {
                     }
                     SwarmEvent::ConnectionClosed{peer_id,num_established:0,..}=>{self.peers.remove(&peer_id);self.queues.remove(&peer_id);self.rates.remove(&peer_id);self.requests.retain(|_,p|p.peer!=peer_id);},
                     SwarmEvent::Behaviour(Event::Message{peer,message,..})=>match message{
-                        Message::Request{request,channel,..}=>{let answer=self.answer(peer,request).unwrap_or(Response::Denied);let _=swarm.behaviour_mut().send_response(channel,answer);},
+                        Message::Request{request,channel,..}=>{let mut answer=self.answer(peer,request).unwrap_or(Response::Denied);
+                            self.credit=(self.credit+self.credit_at.elapsed().as_secs_f64()*500_000.0).min(500_000.0);self.credit_at=Instant::now();
+                            let bytes=postcard::to_allocvec(&answer).map(|b|b.len()).unwrap_or(usize::MAX);
+                            if bytes as f64>self.credit{answer=Response::Busy;}else{self.credit-=bytes as f64;}
+                            let _=swarm.behaviour_mut().send_response(channel,answer);},
                         Message::Response{request_id,response}=>{if let Some(p)=self.requests.remove(&request_id){if p.peer==peer{if let Err(e)=self.receive(p,response){self.status=e.to_string();self.queues.remove(&peer);}}}},
                     },
                     SwarmEvent::Behaviour(Event::OutboundFailure{request_id,error,..})=>{self.requests.remove(&request_id);self.status=format!("同步未完成：{error}");},
@@ -881,6 +996,7 @@ mod tests {
             parents: vec![],
             title: "真实网络".into(),
             body: "中文正文".into(),
+            attachments: vec![],
         })
         .unwrap();
         b.handle(ForumRequest::Sync).unwrap();
@@ -891,11 +1007,52 @@ mod tests {
             .to_owned();
         b.handle(ForumRequest::Fetch { hash }).unwrap();
         wait(|| state(&b)["topics"][0]["versions"][0]["body"] == "中文正文");
+        let source = a_dir.path().join("upload-source");
+        let payload = vec![42u8; 800_000];
+        std::fs::write(&source, &payload).unwrap();
+        let attached = a
+            .attach("测试.bin".into(), std::fs::File::open(source).unwrap())
+            .unwrap()["attachment"]
+            .clone();
+        let input: AttachmentInput = serde_json::from_value(attached.clone()).unwrap();
+        a.handle(ForumRequest::Publish {
+            target: None,
+            reply_to: None,
+            parents: vec![],
+            title: "附件主题".into(),
+            body: "附件".into(),
+            attachments: vec![input],
+        })
+        .unwrap();
+        b.handle(ForumRequest::Sync).unwrap();
+        wait(|| state(&b)["topics"].as_array().unwrap().len() == 2);
+        let hash = attached["hash"].as_str().unwrap().to_owned();
+        b.handle(ForumRequest::Fetch { hash: hash.clone() })
+            .unwrap();
+        wait(|| {
+            state(&b)["topics"].as_array().unwrap().iter().any(|t| {
+                t["versions"].as_array().unwrap().iter().any(|v| {
+                    v["attachments"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|a| a["hash"] == hash && a["ready"] == true)
+                })
+            })
+        });
+        let target = b_dir.path().join("export");
+        b.export(hash, std::fs::File::create(&target).unwrap())
+            .unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), payload);
         b.handle(ForumRequest::State).unwrap();
         drop(b);
         std::thread::sleep(Duration::from_millis(150));
         let b = ForumService::start([2; 32], [9; 32], b_dir.path().into()).unwrap();
-        assert_eq!(state(&b)["topics"][0]["versions"][0]["body"], "中文正文");
+        assert!(state(&b)["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["versions"][0]["body"] == "中文正文"));
     }
     #[test]
     fn identity_of_authenticated_connection_controls_access() {
@@ -909,6 +1066,7 @@ mod tests {
         w.saved = Some(Saved {
             name: "test".into(),
             forum: Forum::new([7; 32], w.key.public().encode_protobuf()).unwrap(),
+            cached: BTreeMap::new(),
         });
         w.refresh();
         let stranger = Keypair::ed25519_from_bytes([2; 32])

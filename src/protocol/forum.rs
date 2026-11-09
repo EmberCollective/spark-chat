@@ -75,6 +75,7 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Query {
+    Chunk { hash: Digest, offset: u64 },
     Hello { governance: Vec<SignedRecord> },
     Inventory { after: Option<Digest> },
     Records { ids: Vec<Digest> },
@@ -82,6 +83,13 @@ pub enum Query {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
+    Busy,
+    Chunk {
+        hash: Digest,
+        offset: u64,
+        total: u64,
+        bytes: Option<Vec<u8>>,
+    },
     Denied,
     Hello {
         governance: Vec<SignedRecord>,
