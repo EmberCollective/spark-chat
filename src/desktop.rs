@@ -78,6 +78,9 @@ enum Request {
     SendFile {
         session_id: Option<String>,
     },
+    OpenLink {
+        url: String,
+    },
     OpenFile {
         id: String,
     },
@@ -87,6 +90,15 @@ enum Request {
     SaveFile {
         id: String,
     },
+}
+
+fn validated_link(value: &str) -> Result<tauri::Url, String> {
+    if value.len() > 4096 || value.chars().any(char::is_control) { return Err("链接格式无效".into()); }
+    let url = tauri::Url::parse(value).map_err(|_| "链接格式无效")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err("仅支持不含登录凭据的 HTTP/HTTPS 链接".into());
+    }
+    Ok(url)
 }
 
 #[tauri::command]
@@ -232,6 +244,20 @@ async fn dispatch(
                     .map_err(|_| "聊天服务暂时不可用")?
                     .save_received(id, &path)?;
                 return Ok(json!(path.to_string_lossy()));
+            }
+            #[cfg(not(target_os = "android"))]
+            Request::OpenLink { url } => {
+                let url = validated_link(&url)?;
+                #[cfg(target_os = "macos")]
+                let mut command = std::process::Command::new("/usr/bin/open");
+                #[cfg(target_os = "windows")]
+                let mut command = std::process::Command::new("explorer.exe");
+                #[cfg(target_os = "linux")]
+                let mut command = std::process::Command::new("xdg-open");
+                if !command.arg(url.as_str()).status().map_err(|e| e.to_string())?.success() {
+                    return Err("系统未能打开浏览器".into());
+                }
+                return Ok(Value::Null);
             }
             #[cfg(not(target_os = "android"))]
             Request::OpenFile { id } => {
@@ -414,4 +440,13 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod link_tests {
+    #[test]
+    fn external_links_only_allow_web_addresses() {
+        for bad in ["file:///etc/passwd", "javascript:alert(1)", "https://user:secret@example.com", "https://example.com/\n"] { assert!(super::validated_link(bad).is_err()); }
+        assert!(super::validated_link("https://example.com/路径?a=1").is_ok());
+    }
 }

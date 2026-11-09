@@ -15,3 +15,7 @@
 .forum-member code { overflow-wrap:anywhere; max-width:100%; }
 #forum-status { overflow-wrap:anywhere; }
 @media(max-width:600px) { .forum-panel {padding:12px;} .forum-panel button,.forum-panel summary {min-height:48px;} .forum-post {padding:12px;} }
+
+.forum-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.forum-compare select { max-width: 100%; }
+@media (max-width: 600px) { .forum-compare { grid-template-columns: 1fr; } }

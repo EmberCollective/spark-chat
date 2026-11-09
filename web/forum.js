@@ -8,6 +8,7 @@
   const editor = document.getElementById("forum-editor");
   let snapshot = null;
   let selected = null;
+  let pageOffset = 0;
   let parents = [];
   let busy = false;
   let epoch = 0;
@@ -64,6 +65,10 @@
     if (serialized === rendered) return;
     rendered = serialized;
     snapshot = data;
+    pageOffset = data.page_offset || 0;
+    if (Object.hasOwn(data, "focused_topic")) selected = data.focused_topic;
+    list.hidden = Boolean(selected);
+    if (!selected) detail.replaceChildren();
     $f("forum-own-public").value = data.own_public || "";
     $f("forum-setup").hidden = Boolean(data.joined);
     $f("forum-main").hidden = !data.joined;
@@ -92,28 +97,59 @@
     const query = $f("forum-search").value.trim().toLowerCase();
     list.replaceChildren();
     const topics = (snapshot?.topics || []).filter(t => !t.reply_to && (!t.hidden || snapshot.admin) &&
-      (!query || t.title.toLowerCase().includes(query)));
+      (!query || t.title.toLowerCase().includes(query) || t.versions.some(v => v.body?.toLowerCase().includes(query))));
     for (const topic of topics) {
       const row = node("button", undefined, "forum-topic");
       row.type = "button";
       row.append(node("strong", `${topic.hidden ? "[已隐藏] " : ""}${topic.title || "未命名主题"}`));
       row.append(node("span", `${topic.author.slice(-8)} · ${topic.heads.length > 1 ? `${topic.heads.length} 个并发版本` : "签名已验证"}`, "subtle"));
-      row.addEventListener("click", () => { selected = topic.id; renderDetail(); });
+      row.addEventListener("click", async () => {
+        selected = topic.id;
+        await run({ kind: "topic", id: topic.id, offset: 0 });
+        renderDetail();
+      });
       list.append(row);
     }
+    paginate(list, pageOffset, snapshot?.total || 0, offset => run({ kind: "page", offset }));
     if (!topics.length) list.append(node("p", query ? "没有匹配的已同步主题。" : "还没有主题，发布第一条内容吧。", "subtle"));
+  }
+  function paginate(container, offset, total, action) {
+    const size = snapshot?.page_size || 20;
+    if (total <= size) return;
+    const controls = node("nav", undefined, "forum-member");
+    controls.setAttribute("aria-label", "分页浏览");
+    if (offset > 0) controls.append(button("上一页", () => action(Math.max(0, offset - size))));
+    controls.append(node("span", `${offset + 1}–${Math.min(offset + size, total)} / ${total}`));
+    if (offset + size < total) controls.append(button("下一页", () => action(offset + size)));
+    container.append(controls);
+  }
+  function bodyView(text) {
+    const paragraph = node("p", undefined, "forum-body");
+    for (const part of text.split(/(https?:\/\/[^\s<>]+)/g)) {
+      if (!/^https?:\/\//.test(part)) { paragraph.append(document.createTextNode(part)); continue; }
+      const link = node("a", part); link.href = part;
+      link.addEventListener("click", event => {
+        event.preventDefault();
+        window.__TAURI__.core.invoke("dispatch", {request:{action:"open_link",url:part}}).catch(note);
+      });
+      paragraph.append(link);
+    }
+    return paragraph;
   }
   function contentView(topic) {
     const article = node("article", undefined, "forum-post");
     article.append(node("h3", topic.title || "回复"));
     article.append(node("p", `创建者 ${topic.author.slice(-8)} · ${topic.id.slice(0, 12)}`, "subtle"));
-    if (topic.heads.length > 1) article.append(node("p", "有并发修改，以下版本均已保留。可编辑并提交一个合并版本。", "forum-conflict"));
+    if (topic.heads.length > 1) {
+      article.append(node("p", topic.merged_body != null ? "不重叠的修改已自动组合；原始署名版本仍保留。" : "有并发修改，以下版本均已保留。可编辑并提交一个合并版本。", "forum-conflict"));
+      if (topic.merged_body != null) article.append(bodyView(topic.merged_body));
+    }
     const history = node("details");
     history.append(node("summary", "查看署名修改历史"));
     for (const version of topic.versions || []) {
       const section = node("section", undefined, "forum-version");
       section.append(node("p", `修改者 ${version.author.slice(-8)} · ${version.id.slice(0, 12)}`, "subtle"));
-      if (version.body != null) section.append(node("p", version.body, "forum-body"));
+      if (version.body != null) section.append(bodyView(version.body));
       else section.append(button("查找并获取正文", () => run({ kind: "fetch", hash: version.body_hash })));
       for (const attachment of version.attachments || []) {
         section.append(button(`${attachment.name} · ${(attachment.size / 1e6).toFixed(2)} MB · ${attachment.ready ? "保存文件" : "查找副本"}`, async () => {
@@ -136,14 +172,28 @@
       else history.append(section);
     }
     if (history.children.length > 1) article.append(history);
-    article.append(button(topic.heads.length > 1 ? "编辑并解决分支" : "署名编辑", () => openEditor(topic)));
+    const versions = topic.versions || [];
+    if (versions.length > 1) {
+      const comparison = node("details"); comparison.append(node("summary", "对照两个版本"));
+      const columns = node("div", undefined, "forum-compare");
+      [0, versions.length - 1].forEach(initial => {
+        const column = node("section"); const picker = node("select");
+        picker.setAttribute("aria-label", "选择对照版本");
+        versions.forEach((version, index) => { const option = node("option", `${version.author.slice(-8)} · ${version.id.slice(0,8)}`); option.value = index; picker.append(option); });
+        const body = node("div"); picker.value = initial;
+        const show = () => { const version = versions[Number(picker.value)]; body.replaceChildren(version.body == null ? button("获取此版本正文", () => run({kind:"fetch",hash:version.body_hash})) : bodyView(version.body)); };
+        picker.addEventListener("change", show); show(); column.append(picker, body); columns.append(column);
+      });
+      comparison.append(columns); article.append(comparison);
+    }
+    article.append(button(topic.heads.length > 1 ? "编辑并确认合并" : "署名编辑", () => openEditor(topic)));
     return article;
   }
   function renderDetail() {
     detail.replaceChildren();
     const topic = snapshot?.topics?.find(t => t.id === selected);
     if (!topic) return;
-    detail.append(button("返回主题列表", () => { selected = null; detail.replaceChildren(); list.hidden = false; }));
+    detail.append(button("返回主题列表", () => run({ kind: "page", offset: pageOffset })));
     list.hidden = true;
     if (topic.hidden) { detail.append(node("p", "该主题已由管理员隐藏。")); if(snapshot.admin) detail.append(button("恢复显示",()=>run({kind:"moderate",target:selected,hidden:false}))); return; }
     detail.append(contentView(topic));
@@ -154,6 +204,7 @@
       }
     }
     for (const reply of snapshot.topics.filter(t => t.reply_to === selected && !t.hidden)) detail.append(contentView(reply));
+    paginate(detail, snapshot.reply_offset || 0, snapshot.reply_total || 0, offset => run({ kind: "topic", id: selected, offset }));
     detail.append(button("回复", () => openEditor(null, selected)));
     if (snapshot.admin) detail.append(button("隐藏主题", () => run({ kind: "moderate", target: selected, hidden: true })));
   }
@@ -165,7 +216,7 @@
     editor.dataset.replyTo = replyTo || "";
     parents = topic?.heads || [];
     $f("forum-title").value = topic?.title || "";
-    $f("forum-body").value = current?.body || "";
+    $f("forum-body").value = topic?.merged_body ?? current?.body ?? "";
     attachments = [...(current?.attachments || [])];
     renderAttachments();
     $f("forum-submit").textContent = topic ? "签署并提交修改" : "签署并发布";
