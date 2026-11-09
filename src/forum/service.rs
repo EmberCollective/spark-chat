@@ -134,6 +134,9 @@ pub enum ForumRequest {
     Fetch {
         hash: String,
     },
+    CancelFetch {
+        hash: String,
+    },
     Sync,
 }
 struct Command {
@@ -570,7 +573,7 @@ impl Worker {
                 topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"locked":topic.locked,"category":topic.category,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body(&topic.root).ok().flatten()}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"categories":self.view.categories,"reports":if self.saved.as_ref().is_some_and(|s|s.forum.admin==self.key.public().encode_protobuf()){self.view.reports.iter().map(|r|json!({"id":hex(&r.id),"target":hex(&r.target),"author":URL_SAFE_NO_PAD.encode(&r.author),"reason":r.reason})).collect::<Vec<_>>()}else{vec![]},"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"downloads":self.downloads.values().map(|d|json!({"hash":hex(&d.hash),"size":d.size,"received":d.received})).collect::<Vec<_>>(),"categories":self.view.categories,"reports":if self.saved.as_ref().is_some_and(|s|s.forum.admin==self.key.public().encode_protobuf()){self.view.reports.iter().map(|r|json!({"id":hex(&r.id),"target":hex(&r.target),"author":URL_SAFE_NO_PAD.encode(&r.author),"reason":r.reason})).collect::<Vec<_>>()}else{vec![]},"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
     }
     fn search(&self, query: &str, offset: usize) -> Result<Value> {
         let query = query.trim();
@@ -1020,6 +1023,9 @@ impl Worker {
                     self.offer_local(peer);
                 }
             }
+            ForumRequest::CancelFetch { hash } => {
+                self.cancel_fetch(parse_hash(&hash)?);
+            }
             ForumRequest::Fetch { hash } => {
                 let hash = parse_hash(&hash)?;
                 if self.shown_bodies.len() >= 16 {
@@ -1055,6 +1061,22 @@ impl Worker {
             code = Some(self.entry()?);
         }
         Ok(json!({"state":self.state(),"code":code,"attachment":attachment}))
+    }
+    fn cancel_fetch(&mut self, hash: Digest) {
+        self.downloads.remove(&hash);
+        self.wanted.remove(&hash);
+        self.replication_downloads.retain(|(_, h)| *h != hash);
+        let matches = |q: &Query| match q {
+            Query::Body { hash: h }
+            | Query::Chunk { hash: h, .. }
+            | Query::Find { hash: h, .. } => *h == hash,
+            _ => false,
+        };
+        for queue in self.queues.values_mut() {
+            queue.retain(|q| !matches(q));
+        }
+        self.requests.retain(|_, p| !matches(&p.query));
+        self.status = "已取消后续下载，完整缓存保持不变".into();
     }
     fn enqueue(&mut self, peer: PeerId, query: Query) {
         let queue = self.queues.entry(peer).or_default();
@@ -1418,7 +1440,8 @@ impl Worker {
                     if self.dirty&&last_save.elapsed()>Duration::from_secs(1){if let Err(e)=self.persist(){self.status=format!("保存失败：{e}");}last_save=Instant::now();}
                     let expired:Vec<_>=self.authenticating.iter().filter(|(_,t)|t.elapsed()>Duration::from_secs(5)).map(|(p,_)|*p).chain(self.peers.iter().filter(|p|!self.allowed(p)).copied()).collect();
                     for peer in expired {let _=swarm.disconnect_peer_id(peer);self.authenticating.remove(&peer);self.peers.remove(&peer);self.queues.remove(&peer);}
-                    self.downloads.retain(|_,d|d.updated.elapsed()<Duration::from_secs(30));
+                    let stalled:Vec<_>=self.downloads.iter().filter(|(_,d)|d.updated.elapsed()>Duration::from_secs(30)).map(|(h,_)|*h).collect();
+                    for hash in stalled{self.cancel_fetch(hash);self.status="附件下载停滞，已保留现有完整缓存，可重新获取".into();}
                     self.replication_tick();
                     self.discovery_tick(&mut swarm);
                     self.next(&mut swarm);
