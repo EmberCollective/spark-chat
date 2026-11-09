@@ -62,17 +62,48 @@ fn two_inbound_peers_remain_independent() {
         unreachable!()
     };
     assert_ne!(b_id, c_id);
+    a.send(NetCmd::StartListen).unwrap();
+    wait(&ar, |e| matches!(e, NetEvent::ListenCode { .. }));
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+    let image = encoded.into_inner();
     b.send(NetCmd::Ready).unwrap();
-    b.send(NetCmd::SendImage(vec![1, 2, 3])).unwrap();
+    b.send(NetCmd::SendImage(image.clone())).unwrap();
     let denied = br.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(matches!(denied, NetEvent::Error(ref reason) if reason.contains("未被接收")), "image rejected until App approves peer: {denied:?}");
     targeted(&a, &b_id, NetCmd::Ready);
-    b.send(NetCmd::SendImage(vec![4, 5, 6])).unwrap();
+    b.send(NetCmd::SendImage(image.clone())).unwrap();
     let NetEvent::PeerEvent { peer_id, event } = wait(&ar, |e| matches!(e, NetEvent::PeerEvent { event, .. } if matches!(event.as_ref(), NetEvent::ImageIncoming { .. }))) else { unreachable!() };
     assert_eq!(peer_id, b_id);
     let NetEvent::ImageIncoming { id, bytes } = *event else { unreachable!() };
-    assert_eq!(bytes, vec![4, 5, 6]);
+    assert_eq!(bytes, image);
     targeted(&a, &b_id, NetCmd::ImageResult { id, result: Ok(()) });
+    wait(&br, |e| matches!(e, NetEvent::ImageDelivered));
+    // An oversized outgoing image is refused before it reaches the other peer.
+    b.send(NetCmd::SendImage(vec![0; spark_chat::images::MAX_IMAGE_BYTES + 1])).unwrap();
+    assert!(matches!(br.recv_timeout(Duration::from_secs(5)).unwrap(), NetEvent::Error(_)));
+    // Reusing the same image content is a new deliberate send, not a duplicate ID collision.
+    b.send(NetCmd::SendImage(image.clone())).unwrap();
+    c.send(NetCmd::SendText("parallel C message".into())).unwrap();
+    let mut saw_c = false;
+    let mut saw_image = false;
+    while !saw_c || !saw_image {
+        let ev = ar.recv_timeout(Duration::from_secs(5)).unwrap();
+        match ev {
+            NetEvent::PeerEvent { peer_id, event } => match *event {
+                NetEvent::ImageIncoming { id, bytes } => {
+                    assert_eq!(peer_id, b_id);
+                    assert_eq!(bytes, image);
+                    targeted(&a, &b_id, NetCmd::ImageResult { id, result: Ok(()) });
+                    saw_image = true;
+                },
+                NetEvent::Msg(text) => { assert_eq!(peer_id, c_id); assert_eq!(text, "parallel C message"); saw_c = true; },
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    wait(&br, |e| matches!(e, NetEvent::ImageDelivered));
     targeted(&a, &b_id, NetCmd::SendText("only B".into()));
     targeted(&a, &c_id, NetCmd::SendText("only C".into()));
     assert!(

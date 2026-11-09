@@ -56,6 +56,7 @@ pub enum NetCmd {
 
 #[derive(Debug)]
 pub enum NetEvent {
+    ImageDelivered,
     ImageIncoming { id: u64, bytes: Vec<u8> },
     PeerEvent { peer_id: String, event: Box<NetEvent> },
     ListenCode {
@@ -367,6 +368,7 @@ async fn async_main(
             }
         }
         let target = match &action {
+            Action::Command(NetCmd::StartListen | NetCmd::Shutdown) => None,
             Action::Command(NetCmd::Dial(code)) => protocol::decode_conn_code(code.trim()).ok().and_then(|i| i.peer_id.parse().ok()),
             Action::Command(NetCmd::To { peer_id, .. }) => peer_id.parse().ok(),
             Action::Network(ev) => event_peer(ev),
@@ -377,7 +379,7 @@ async fn async_main(
             if !states.contains_key(&p) && states.len() >= MAX_PEERS {
                 let _ = swarm.disconnect_peer_id(p);
                 evt_tx.peer = None;
-                let _ = evt_tx.send(NetEvent::Error("同时最多保留 8 个聊天会话，请锁定后重新连接".into()));
+                let _ = evt_tx.send(NetEvent::Error("同时最多连接 8 个聊天对象，请断开一个连接后重试".into()));
                 continue;
             }
         }
@@ -645,7 +647,10 @@ async fn async_main(
                         RREvent::Message { message: Message::Response { request_id, response }, .. } => {
                             if image_out == Some(request_id) {
                                 image_out = None;
-                                if let ImageReply::Rejected(reason) = response { let _ = evt_tx.send(NetEvent::Error(format!("图片未被接收：{reason}"))); }
+                                match response {
+                    ImageReply::Accepted => { let _ = evt_tx.send(NetEvent::ImageDelivered); },
+                    ImageReply::Rejected(reason) => { let _ = evt_tx.send(NetEvent::Error(format!("图片未被接收：{reason}"))); },
+                }
                             }
                         },
                         RREvent::OutboundFailure { request_id, error, .. } => {
@@ -695,7 +700,9 @@ async fn async_main(
             texts.flush(&mut swarm, &p);
         }
         state = PeerState { peer, pending_dial, next_seq, incoming, outgoing, texts, preparing, ready, image_in, image_out };
-        if let Some(p) = target { states.insert(p, state); }
+        if let Some(p) = target {
+            if state.peer.is_some() || state.pending_dial.is_some() { states.insert(p, state); }
+        }
     }
 }
 

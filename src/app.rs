@@ -754,9 +754,14 @@ impl AppHooks for App {
                     self.session = None;
                     self.net_evt = None;
                     self.net_cmd = None;
-                    out.push(UiEvent::Disconnected(
-                        "网络线程已停止，请锁定后重新解锁".into(),
-                    ));
+                    for (peer, state) in &mut self.chats {
+                        state.session = None;
+                        state.early_msgs.clear();
+                        state.incoming_ids.clear();
+                        out.push(UiEvent::SessionEvent { session_id: peer.clone(), event: Box::new(UiEvent::Disconnected("网络线程已停止，请锁定后重新解锁".into())) });
+                    }
+                    let error = UiEvent::Disconnected("网络线程已停止，请锁定后重新解锁".into());
+                    out.push(if self.multi { UiEvent::SessionEvent { session_id: self.active_session(), event: Box::new(error) } } else { error });
                     break;
                 }
                 _ => break,
@@ -774,6 +779,7 @@ impl AppHooks for App {
             'event: {
             match event {
                     NetEvent::PeerEvent { .. } => unreachable!("nested peer event"),
+                NetEvent::ImageDelivered => {},
                 NetEvent::ImageIncoming { id, bytes } => {
                     let result = if self.session.is_some() {
                         self.store_image(&self.active_session(), &bytes, false)
@@ -1044,6 +1050,50 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn real_apps_exchange_image_into_encrypted_preview_cache() {
+        use std::time::{Duration, Instant};
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        std::env::set_var("SPARK_PORT", port.to_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut a = App::with_dir(tmp.path().join("a"));
+        let mut b = App::with_dir(tmp.path().join("b"));
+        a.authenticate("test-password", tmp.path().join("a.key").to_str().unwrap(), true).unwrap();
+        b.authenticate("test-password", tmp.path().join("b.key").to_str().unwrap(), true).unwrap();
+        a.listen().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let code = loop {
+            if let Some(code) = a.poll_events().into_iter().find_map(|event| if let UiEvent::ListenCode { code, .. } = event { Some(code) } else { None }) { break code; }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut info = crate::protocol::decode_conn_code(&code).unwrap();
+        info.addrs = vec![format!("/ip4/127.0.0.1/tcp/{port}")];
+        b.connect(&crate::protocol::encode_conn_code(&info).unwrap()).unwrap();
+        while a.session.is_none() || b.session.is_none() {
+            a.poll_events(); b.poll_events();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let a_id = a.my_pid.clone(); let b_id = b.my_pid.clone();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(3, 3).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let sent = a.image_to(&b_id, encoded.get_ref()).unwrap();
+        b.text_to(&a_id, "parallel text").unwrap();
+        while b.images.get(&a_id).is_none_or(Vec::is_empty) || a.msgs.is_empty() {
+            a.poll_events(); b.poll_events();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let received = &b.images[&a_id][0];
+        assert!(!received.own);
+        assert_eq!(a.image_preview(&b_id, &sent.id).unwrap(), b.image_preview(&a_id, &received.id).unwrap());
+        assert_eq!(a.msgs.last().unwrap().text, "parallel text");
+        a.lock(); b.lock();
+    }
+
     #[test]
     fn image_preview_is_scoped_encrypted_and_restored_after_unlock() {
         let tmp = tempfile::tempdir().unwrap();

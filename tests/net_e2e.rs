@@ -50,6 +50,7 @@ impl Tag for NetEvent {
         match self {
             NetEvent::PeerEvent { .. } => "PeerEvent",
             NetEvent::ImageIncoming { .. } => "ImageIncoming",
+            NetEvent::ImageDelivered => "ImageDelivered",
             NetEvent::ListenCode { .. } => "ListenCode",
             NetEvent::PeerKey { .. } => "PeerKey",
             NetEvent::Connected(_) => "Connected",

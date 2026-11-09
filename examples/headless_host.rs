@@ -82,6 +82,7 @@ fn tag(e: &NetEvent) -> &'static str {
     match e {
         NetEvent::PeerEvent { .. } => "PeerEvent",
         NetEvent::ImageIncoming { .. } => "ImageIncoming",
+            NetEvent::ImageDelivered => "ImageDelivered",
         NetEvent::ListenCode { .. } => "ListenCode",
         NetEvent::PeerKey { .. } => "PeerKey",
         NetEvent::Connected(_) => "Connected",
