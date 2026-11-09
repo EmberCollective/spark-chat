@@ -1,7 +1,7 @@
 //! 集成层：密钥留在 Rust，界面只收到可显示的状态与消息。
 use crate::net::{self, NetCmd, NetEvent};
 use crate::netpos::{self, Position};
-use crate::ui::{AppHooks, NetPosKind, UiEvent, UiMsg};
+use crate::ui::{AppHooks, NetPosKind, UiEvent, UiMsg, UiImage};
 use crate::vault::{Session, Vault};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,6 +23,7 @@ pub struct InitialFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InitialSession {
+    pub images: Vec<UiImage>,
     pub id: String,
     pub connected: bool,
     pub history: Vec<UiMsg>,
@@ -44,6 +45,7 @@ struct ChatState {
 
 #[derive(Serialize)]
 pub struct InitialState {
+    pub images: Vec<UiImage>,
     pub active_session: String,
     pub sessions: Vec<InitialSession>,
     pub vault_created: bool,
@@ -66,6 +68,8 @@ struct Prefs {
 }
 
 pub struct App {
+    image_cache: Option<crate::images::ImageCache>,
+    images: HashMap<String, Vec<UiImage>>,
     chats: HashMap<String, ChatState>,
     multi: bool,
     dir: PathBuf,
@@ -104,6 +108,8 @@ impl App {
 
     pub(crate) fn with_dir(dir: PathBuf) -> Self {
         Self {
+            image_cache: None,
+            images: HashMap::new(),
             chats: HashMap::new(),
             multi: false,
             dir,
@@ -125,6 +131,63 @@ impl App {
             pos_sent: false,
             errors: Vec::new(),
         }
+    }
+
+    fn open_image_cache(&mut self, vault: &Vault) -> Result<(), String> {
+        use zeroize::Zeroize;
+        let mut seed = vault.ed25519_seed();
+        let mut key = [0u8; 32];
+        let derived = hkdf::Hkdf::<sha2::Sha256>::new(None, &seed).expand(b"spark-chat/private-image-cache/v1", &mut key);
+        seed.zeroize();
+        derived.map_err(|_| "图片缓存密钥派生失败")?;
+        let cache = crate::images::ImageCache::new(self.dir.join("private-images"), key).map_err(|e| e.to_string());
+        key.zeroize();
+        let cache = cache?;
+        let index = cache.load_index().map_err(|e| format!("图片索引无法读取：{e}"))?;
+        let images: HashMap<String, Vec<UiImage>> = match index {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("图片索引损坏，原文件已保留：{e}"))?,
+            None => HashMap::new(),
+        };
+        if images.values().map(Vec::len).sum::<usize>() > 128 { return Err("图片索引数量异常".into()); }
+        for peer in images.keys() {
+            self.chats.entry(peer.clone()).or_insert_with(|| ChatState { peer_pid: Some(peer.clone()), ..Default::default() });
+        }
+        self.images = images;
+        self.image_cache = Some(cache);
+        Ok(())
+    }
+
+    fn store_image(&mut self, peer: &str, bytes: &[u8], own: bool) -> Result<UiImage, String> {
+        let cache = self.image_cache.as_ref().ok_or("图片缓存尚未解锁")?;
+        let id = cache.put(bytes).map_err(|e| e.to_string())?;
+        let normalized = cache.get(&id).map_err(|e| e.to_string())?;
+        let image = UiImage { id, own, ts: now_ms(), mime: normalized.mime };
+        self.images.entry(peer.into()).or_default().push(image.clone());
+        let result = serde_json::to_vec(&self.images).map_err(|e| e.to_string()).and_then(|bytes| cache.save_index(&bytes).map_err(|e| e.to_string()));
+        if let Err(error) = result {
+            self.images.get_mut(peer).unwrap().pop();
+            return Err(format!("图片索引未保存：{error}"));
+        }
+        Ok(image)
+    }
+
+    pub fn image_to(&mut self, peer: &str, bytes: &[u8]) -> Result<UiImage, String> {
+        self.for_session(peer, |app| {
+            if app.session.is_none() { return Err("请先连接对方再发送图片".into()); }
+            let image = app.store_image(peer, bytes, true)?;
+            let data = app.image_cache.as_ref().unwrap().get(&image.id).map_err(|e| e.to_string())?;
+            app.send(NetCmd::SendImage(data.bytes)).map_err(|e| format!("图片已保存在本机但未发送：{e}"))?;
+            Ok(image)
+        })
+    }
+
+    pub fn image_preview(&self, peer: &str, id: &str) -> Result<String, String> {
+        use base64::Engine;
+        if !self.images.get(peer).is_some_and(|images| images.iter().any(|image| image.id == id)) {
+            return Err("图片不属于该会话或已失效".into());
+        }
+        let image = self.image_cache.as_ref().ok_or("请先解锁")?.get(id).map_err(|e| e.to_string())?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(image.bytes))
     }
 
     pub(crate) fn forum_material(&self) -> Result<([u8; 32], PathBuf), String> {
@@ -216,6 +279,7 @@ impl App {
             .chats
             .iter()
             .map(|(id, state)| InitialSession {
+                images: self.images.get(id).cloned().unwrap_or_default(),
                 id: id.clone(),
                 connected: state.session.is_some(),
                 history: state.msgs.clone(),
@@ -224,6 +288,7 @@ impl App {
             .collect();
         if let Some(id) = &self.peer_pid {
             snapshots.push(InitialSession {
+                images: self.images.get(id).cloned().unwrap_or_default(),
                 id: id.clone(),
                 connected: self.session.is_some(),
                 history: self.msgs.clone(),
@@ -253,6 +318,7 @@ impl App {
             .unwrap_or_default();
         let position = netpos::detect();
         InitialState {
+            images: self.images.get(&self.active_session()).cloned().unwrap_or_default(),
             active_session: self.active_session(),
             sessions: self.session_snapshots(),
             mobile: cfg!(target_os = "android"),
@@ -334,6 +400,7 @@ impl App {
                 "已经解锁，但记住钥匙文件位置失败：{e}。下次打开时请重新选择文件。"
             )));
         }
+        self.open_image_cache(&v)?;
         self.my_pid = v.peer_id();
         let (cmd, evt) = net::spawn_multi(v.ed25519_seed(), v.x25519_pub());
         self.multi = true;
@@ -349,6 +416,8 @@ impl App {
     }
 
     pub fn lock(&mut self) {
+        self.image_cache = None;
+        self.images.clear();
         self.chats.clear();
         self.multi = false;
         if let Some(tx) = self.net_cmd.take() {
@@ -705,6 +774,14 @@ impl AppHooks for App {
             'event: {
             match event {
                     NetEvent::PeerEvent { .. } => unreachable!("nested peer event"),
+                NetEvent::ImageIncoming { id, bytes } => {
+                    let result = if self.session.is_some() {
+                        self.store_image(&self.active_session(), &bytes, false)
+                    } else { Err("聊天身份尚未验证".into()) };
+                    let reply = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                    let _ = self.send(NetCmd::ImageResult { id, result: reply });
+                    match result { Ok(image) => out.push(UiEvent::Image(image)), Err(error) => out.push(UiEvent::Error(format!("图片接收失败：{error}"))) }
+                }
                 NetEvent::ListenCode { code, verify } => {
                     out.push(UiEvent::ListenCode { code, verify })
                 }
@@ -752,6 +829,7 @@ impl AppHooks for App {
                     }
                     match self.open_peer(x25519_pub) {
                         Ok(history) => {
+                            let _ = self.send(NetCmd::Ready);
                             out.push(UiEvent::History(history));
                             out.push(UiEvent::SessionReady(
                                 self.peer_pid.clone().unwrap_or_default(),
@@ -967,6 +1045,32 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     #[test]
+    fn image_preview_is_scoped_encrypted_and_restored_after_unlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v");
+        let keyfile = tmp.path().join("kf");
+        let (vault, _) = Vault::create("test-password", &keyfile, &dir).unwrap();
+        let mut app = App::with_dir(dir.clone());
+        app.open_image_cache(&vault).unwrap();
+        app.vault = Some(vault);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let image = app.store_image("alice", encoded.get_ref(), false).unwrap();
+        assert!(!app.image_preview("alice", &image.id).unwrap().is_empty());
+        assert!(app.image_preview("bob", &image.id).is_err());
+        let disk = std::fs::read(dir.join("private-images/index.enc")).unwrap();
+        assert!(!disk.windows(5).any(|window| window == b"alice"));
+        app.lock();
+        assert!(app.image_preview("alice", &image.id).is_err());
+        let vault = Vault::unlock("test-password", &keyfile, &dir).unwrap();
+        app.open_image_cache(&vault).unwrap();
+        app.vault = Some(vault);
+        assert_eq!(app.select_session("alice").unwrap().images[0].id, image.id);
+        assert!(!app.image_preview("alice", &image.id).unwrap().is_empty());
+        assert!(app.image_to("alice", encoded.get_ref()).is_err(), "offline restored history cannot send");
+    }
+
+    #[test]
     fn peer_events_and_targeted_actions_keep_sessions_separate() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("v");
@@ -1000,6 +1104,7 @@ mod tests {
             );
         }
         let events = app.poll_events();
+        while command_rx.try_recv().is_ok() {}
         assert_eq!(app.active_session(), "alice");
         assert_eq!(app.msgs.len(), 1);
         assert_eq!(app.msgs[0].text, "from alice");

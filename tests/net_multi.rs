@@ -62,6 +62,17 @@ fn two_inbound_peers_remain_independent() {
         unreachable!()
     };
     assert_ne!(b_id, c_id);
+    b.send(NetCmd::Ready).unwrap();
+    b.send(NetCmd::SendImage(vec![1, 2, 3])).unwrap();
+    let denied = br.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(denied, NetEvent::Error(ref reason) if reason.contains("未被接收")), "image rejected until App approves peer: {denied:?}");
+    targeted(&a, &b_id, NetCmd::Ready);
+    b.send(NetCmd::SendImage(vec![4, 5, 6])).unwrap();
+    let NetEvent::PeerEvent { peer_id, event } = wait(&ar, |e| matches!(e, NetEvent::PeerEvent { event, .. } if matches!(event.as_ref(), NetEvent::ImageIncoming { .. }))) else { unreachable!() };
+    assert_eq!(peer_id, b_id);
+    let NetEvent::ImageIncoming { id, bytes } = *event else { unreachable!() };
+    assert_eq!(bytes, vec![4, 5, 6]);
+    targeted(&a, &b_id, NetCmd::ImageResult { id, result: Ok(()) });
     targeted(&a, &b_id, NetCmd::SendText("only B".into()));
     targeted(&a, &c_id, NetCmd::SendText("only C".into()));
     assert!(
