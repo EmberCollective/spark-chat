@@ -617,12 +617,24 @@ async function lockChat() {
     $("lock").disabled = false;
   }
 }
-$("lock").addEventListener("click", () => {
-  const pending = [...state.files.values()].some((file) =>
-    !file.failed && (file.outgoing ? !file.complete : !file.saved),
-  );
-  if (pending) $("lock-confirm").showModal();
-  else lockChat();
+$("lock").addEventListener("click", async () => {
+  const generation = state.generation;
+  $("lock").disabled = true;
+  try {
+    const snapshot = await call("initial");
+    if (!state.ready || generation !== state.generation) return;
+    if (!snapshot || typeof snapshot !== "object") throw new Error("无法读取会话状态");
+    const files = snapshot.sessions ? snapshot.sessions.flatMap(session => session.files || []) : snapshot.files || [];
+    const pending = [...files, ...state.files.values()].some(file =>
+      !file.failed && (file.outgoing ? !file.complete : typeof file.saved === "boolean" ? !file.saved : !file.complete),
+    );
+    if (pending) $("lock-confirm").showModal();
+    else await lockChat();
+  } catch (error) {
+    tell(`无法确认所有会话的附件状态，尚未锁定：${error}`);
+  } finally {
+    $("lock").disabled = false;
+  }
 });
 $("cancel-lock").addEventListener("click", () => $("lock-confirm").close());
 $("confirm-lock").addEventListener("click", lockChat);
