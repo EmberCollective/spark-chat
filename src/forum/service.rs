@@ -634,6 +634,10 @@ impl Worker {
         Ok(json!({"query":query,"total":total,"offset":offset,"page_size":20,"results":results}))
     }
     fn commit_forum(&mut self, candidate: Forum) -> Result<()> {
+        // These callers only append immutable records; duplicate sync must not rewrite the snapshot.
+        if candidate.records.len() == self.saved.as_ref().unwrap().forum.records.len() {
+            return Ok(());
+        }
         let previous = std::mem::replace(&mut self.saved.as_mut().unwrap().forum, candidate);
         self.refresh();
         if let Err(error) = self.persist() {
@@ -1696,8 +1700,11 @@ mod tests {
                 .forum
                 .can_access(&member.encode_protobuf(), now())
         );
-        w.apply_governance(vec![revoke]).unwrap();
+        w.apply_governance(vec![revoke.clone()]).unwrap();
         assert!(!w.allowed(&member.to_peer_id()));
+        let stored = std::fs::read(&w.path).unwrap();
+        w.apply_governance(vec![revoke]).unwrap();
+        assert_eq!(std::fs::read(&w.path).unwrap(), stored, "duplicate sync must not rewrite encrypted snapshot");
     }
     #[test]
     fn pending_records_are_not_advertised_or_exported() {
