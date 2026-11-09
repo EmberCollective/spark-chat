@@ -81,6 +81,10 @@
     $f("forum-network").textContent = data.joined
       ? `${data.peers || 0} 个连接 · ${data.pending || 0} 条记录待补齐 · ${data.disputed || 0} 条争议记录`
       : "先创建论坛，或导入管理员提供的入网材料。";
+    if (data.governance_conflict) $f("forum-network").append(" · 管理记录发生分支，授权判断已暂停，请联系管理员。");
+    const ownMember = data.members?.find(member => member.id === data.own_public);
+    if (ownMember?.status === "expired") $f("forum-network").append(" · 你的成员资格已到期，请联系管理员续期。");
+    if (ownMember?.status === "revoked") $f("forum-network").append(" · 你的成员资格已被管理员吊销。");
     const filter = $f("forum-category-filter"), selectedCategory = filter.value;
     filter.replaceChildren(); const all = node("option", "全部版块"); all.value = ""; filter.append(all);
     for (const [id,title] of Object.entries(data.categories || {})) { const option = node("option",title); option.value=id;filter.append(option); }
