@@ -21,6 +21,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 zeroize = "1"
+diffy = "=0.4.2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # 序列化与编码

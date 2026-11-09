@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod storage;
 mod wire;
 pub mod service;
+mod merge;
 #[cfg(test)]
 mod tests;
 
