@@ -22,11 +22,29 @@
   let draftSave = Promise.resolve();
   let page = "home";
   let editorReturn = "home";
+  let toastTimer;
+  let inspectedMember = null;
   const $f = id => document.getElementById(id);
   const command = cmd => window.__TAURI__.core.invoke("dispatch", {
     request: { action: "forum", command: { ...cmd, ...(snapshot?.current_community && !["state","community_list"].includes(cmd.kind) ? {community_id:snapshot.current_community} : {}) } },
   });
-  function note(value) { status.textContent = String(value); status.hidden = !value; }
+  function note(value) { clearTimeout(toastTimer);status.textContent = String(value); status.hidden = !value; if(value)toastTimer=setTimeout(()=>{status.hidden=true;},3500); }
+  async function copyText(value) {
+    if(!navigator.clipboard?.writeText)throw new Error("系统不允许自动复制，请选择并手动复制材料。");
+    await navigator.clipboard.writeText(value);note("已复制。");
+  }
+  function showMaterial(code,title="社区入网材料") {
+    $f("forum-code").value=code;$f("forum-code-box").hidden=false;$f("forum-material-title").textContent=title;
+    $f("forum-material-help").textContent=title==="我的连接入口"?"入口用于连接已获准加入的成员，不能代替社区准入材料。":"仅交给对应受邀者。管理员私钥不会包含在材料中。";
+    if(!$f("forum-material-dialog").open)$f("forum-material-dialog").showModal();
+  }
+  function inspectMember(member) {
+    inspectedMember=member;
+    $f("forum-identity-name").textContent=displayName(member.id);
+    $f("forum-identity-value").value=member.id;
+    $f("forum-member-revoke").hidden=!(snapshot?.admin&&member.active&&member.id!==snapshot.own_public);
+    $f("forum-identity-dialog").showModal();
+  }
   function node(tag, text, className) {
     const element = document.createElement(tag);
     if (text !== undefined) element.textContent = text;
@@ -41,6 +59,7 @@
   }
   function showPage(next) {
     if (next === "admin" && !snapshot?.admin) next = "home";
+    if(page!==next)note("");
     page = next;
     for (const view of panel.querySelectorAll('[id^="forum-view-"]')) view.hidden = view.id !== `forum-view-${next}`;
     for (const nav of panel.querySelectorAll('[data-forum-page]')) nav.classList.toggle("active", nav.dataset.forumPage === next);
@@ -104,7 +123,7 @@
       if (cmd.kind === "page") page = "home";
       if (result?.state) render(result.state);
       else await refresh();
-      if (result?.code) { $f("forum-code").value = result.code; $f("forum-code-box").hidden = false; }
+
       note(result?.message || result?.state?.status || "操作已完成");
       return result;
     } catch (error) { note(error); }
@@ -116,7 +135,7 @@
       const result = await command({ kind: "state" });
       if (generation !== epoch) return;
       render(result.state || result);
-      if (result.code) { $f("forum-code").value = result.code; $f("forum-code-box").hidden = false; }
+
     }
     catch (error) { note(error); }
   }
@@ -125,7 +144,7 @@
     if (serialized === rendered) return;
     rendered = serialized;
     const changedCommunity = snapshot?.current_community && data.current_community !== snapshot.current_community;
-    if(changedCommunity){$f("forum-invite-card").hidden=true;selected=null;requested.clear();searchResult=null;page="home";$f("forum-search").value="";}
+    if(changedCommunity){for(const id of ["forum-material-dialog","forum-identity-dialog","forum-advanced-dialog"])if($f(id).open)$f(id).close();inspectedMember=null;$f("forum-invite-card").hidden=true;selected=null;requested.clear();searchResult=null;page="home";$f("forum-search").value="";}
     snapshot = data;
     pageOffset = data.page_offset || 0;
     if (Object.hasOwn(data, "focused_topic")) selected = data.focused_topic;
@@ -186,14 +205,11 @@
       row.classList.add("member-row");
       const memberName=displayName(member.id), identity=node("div");
       identity.append(node("strong",memberName),node("small",`身份尾号 ${member.id.slice(-8)}`));
-      const proof=node("details");proof.append(node("summary","查看身份"),node("code",member.id));identity.append(proof);
-      row.append(node("span",Array.from(memberName)[0],"avatar"),identity, node("span", ({active:"有效",expired:"已到期",revoked:"已吊销"}[member.status] || (member.active ? "有效" : "不可用"))));
-      if (data.admin && member.active && member.id !== data.own_public) {
-        row.append(button("吊销资格", () => {
-          if (confirm(`吊销 ${member.id} 的论坛资格？未被检查点确认的修改会进入争议状态。此操作由你的管理身份签署。`)) run({ kind: "revoke", member: member.id });
-        }));
-      }
-      if (member.inviter) row.append(node("small", `邀请者 ${displayName(member.inviter)}`));
+      if(data.admin&&member.id===data.own_public)identity.querySelector("small").textContent="社区管理员";
+      else if(member.inviter)identity.querySelector("small").textContent=`邀请者：${displayName(member.inviter)} · 身份尾号 ${member.id.slice(-8)}`;
+      const statusText=({active:"有效",expired:"已到期",revoked:"已吊销"}[member.status] || (member.active?"有效":"不可用"));
+      row.className="member-row";
+      row.append(node("span",Array.from(memberName)[0],"avatar"),identity,node("span",statusText,"status"),button("管理",()=>inspectMember(member)));
       members.append(row);
     }
   }
@@ -414,14 +430,32 @@
   });
   $f("forum-create").addEventListener("click", () => createOrJoin({ kind: "create", name: $f("forum-create-name").value.trim() }));
   $f("forum-join").addEventListener("click", () => createOrJoin({ kind: "join", code: $f("forum-join-code").value.trim() }));
-  $f("forum-listen").addEventListener("click", () => run({ kind: "listen" }));
+  $f("forum-listen").addEventListener("click",async()=>{
+    const generation=epoch;const result=await run({kind:"listen"});if(!result||generation!==epoch)return;
+    let code=result.code;
+    if(!code){const latest=await command({kind:"state"});if(generation!==epoch)return;code=latest.code;}
+    if(!code){note("入口正在准备，请稍后再试。");return;}
+    try{await copyText(code);}catch(error){showMaterial(code,"我的连接入口");note(error);}
+  });
+  $f("forum-material-copy").addEventListener("click",()=>copyText($f("forum-code").value).catch(note));
+  $f("forum-material-close").addEventListener("click",()=>$f("forum-material-dialog").close());
+  $f("forum-identity-copy").addEventListener("click",()=>copyText($f("forum-identity-value").value).catch(note));
+  $f("forum-identity-close").addEventListener("click",()=>$f("forum-identity-dialog").close());
+  $f("forum-member-revoke").addEventListener("click",async()=>{
+    const member=inspectedMember;if(!member||!snapshot?.admin)return;
+    if(confirm(`吊销 ${member.id} 的论坛资格？未被检查点确认的修改会进入争议状态。此操作由你的管理身份签署。`)) {
+      if(await run({kind:"revoke",member:member.id}))$f("forum-identity-dialog").close();
+    }
+  });
   $f("forum-connect").addEventListener("click", () => run({ kind: "connect", code: $f("forum-peer-code").value.trim() }));
   $f("forum-invite-open").addEventListener("click",()=>{$f("forum-invite-card").hidden=false;$f("forum-member-key").focus();});
   $f("forum-invite-cancel").addEventListener("click",()=>{$f("forum-invite-card").hidden=true;});
   $f("forum-admit").addEventListener("click", async () => {
     const result=await run({ kind: "admit", member: $f("forum-member-key").value.trim(), inviter: $f("forum-inviter").value.trim() || null });
-    if(result){$f("forum-invite-card").hidden=true;showPage("network");$f("forum-code-box").open=true;}
+    if(result?.code){$f("forum-invite-card").hidden=true;showMaterial(result.code);}
   });
+  $f("forum-advanced-open").addEventListener("click",()=>$f("forum-advanced-dialog").showModal());
+  $f("forum-advanced-close").addEventListener("click",()=>$f("forum-advanced-dialog").close());
   $f("forum-checkpoint").addEventListener("click", async()=>{
     const records=[...new Set((snapshot?.topics||[]).flatMap(t=>t.versions.filter(v=>!v.disputed).map(v=>v.id)))].sort();
     if(!records.length){note("没有可确认的已同步历史。");return;}
@@ -469,6 +503,8 @@
     snapshot = null; selected = null; parents = []; page="home"; $f("forum-invite-card").hidden=true;
     panel.hidden = true; document.body.classList.remove("forum-mode"); detail.replaceChildren(); list.replaceChildren();
     if($f("forum-profile-dialog")?.open)$f("forum-profile-dialog").close();
+    for(const id of ["forum-material-dialog","forum-identity-dialog","forum-advanced-dialog"])if($f(id).open)$f(id).close();
+    inspectedMember=null;note("");
     for(const id of ["forum-community-list","forum-owned-communities","forum-side-categories","forum-members","forum-reports","forum-downloads"]) $f(id)?.replaceChildren();
     $f("forum-category-filter").replaceChildren();
     for(const id of ["community-current","community-role","forum-name","forum-network","forum-network-detail","forum-header-status"]) if($f(id))$f(id).textContent="";

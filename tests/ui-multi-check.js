@@ -4,6 +4,7 @@
   let active = "peer-alice";
   const peers = { "peer-alice": [], "peer-bob": [] };
   const calls = [];
+  const copied=[];Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{copied.push(text);}}});
   const images = { "peer-alice": [], "peer-bob": [] };
   let pendingImage = null;
   let delayImage = false;
@@ -49,7 +50,7 @@
         if(command.kind==="search") return {search:{query:command.query,offset:command.offset,total:1,results:[{topic_id:"third",title:"主题 third",excerpt:"跨页命中"}]}};
         if(command.kind==="page") Object.assign(forum,{page_offset:command.offset,focused_topic:null,reply_offset:0,reply_total:0,topics:topics.slice(command.offset,command.offset+2)});
         if(command.kind==="topic") Object.assign(forum,{focused_topic:command.id,reply_offset:command.offset,reply_total:command.id==="root"?replies.length:0,topics:[topics.find(t=>t.id===command.id),...(command.id==="root"?replies.slice(command.offset,command.offset+2):[])]});
-        return {state:structuredClone(forum)};
+        return {state:structuredClone(forum),...(command.kind==="listen"?{code:"FORUM-CONNECT-test"}:command.kind==="admit"?{code:"FORUM-INVITE-test"}:{})};
       }
       default:return null;
     }
@@ -99,10 +100,19 @@
       check(visibleViews().length===1&&visibleViews()[0].id==="forum-view-home","论坛默认只显示独立主题首页");
       document.querySelector('[data-forum-page="network"]').click();
       check(visibleViews().length===1&&visibleViews()[0].id==="forum-view-network","网络设置不与主题列表堆叠");
+      check($("forum-view-network").querySelectorAll(":scope > .card").length===2&&!$("forum-view-network").querySelector("details"),"网络页面按获批原型展示两张独立卡片");
+      $("forum-listen").click();await tick();
+      check(copied.includes("FORUM-CONNECT-test")&&!$("forum-material-dialog").open,"复制入口成功不常驻展示长连接码");
       document.querySelector('[data-forum-page="admin"]').click();
       check($("forum-invite-card").hidden,"成员页面默认不堆叠邀请表单");
       $("forum-invite-open").click();check(!$("forum-invite-card").hidden,"邀请成员按需展开独立卡片");
       $("forum-invite-cancel").click();check($("forum-invite-card").hidden,"取消邀请收起表单且保留成员列表");
+      check(!$("forum-members").querySelector("details"),"成员行不常驻完整公钥展开控件");
+      $("forum-members").querySelector("button").click();check($("forum-identity-dialog").open&&$("forum-identity-value").value==="public-self","完整公钥通过独立身份对话框查看");$("forum-identity-close").click();
+      $("forum-advanced-open").click();check($("forum-advanced-dialog").open&&$("forum-checkpoint").closest("dialog"),"历史确认保留在高级管理对话框");$("forum-advanced-close").click();
+      $("forum-invite-open").click();$("forum-member-key").value="new-member";$("forum-admit").click();await tick();
+      check($("forum-material-dialog").open&&$("forum-code").value==="FORUM-INVITE-test"&&visibleViews()[0].id==="forum-view-admin","邀请材料独立显示且不堆到网络页面");
+      $("forum-material-copy").click();await tick();check(copied.includes("FORUM-INVITE-test"),"入网材料可以单独复制");$("forum-material-close").click();
       document.querySelector('[data-forum-admin-tab="boards"]').click();
       check(!$("forum-admin-boards").hidden&&$("forum-admin-members").hidden,"管理后台按任务拆分子页");
       document.querySelector('[data-forum-page="home"]').click();await tick();
