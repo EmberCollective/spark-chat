@@ -408,7 +408,11 @@ impl App {
                 "已经解锁，但记住钥匙文件位置失败：{e}。下次打开时请重新选择文件。"
             )));
         }
-        self.open_image_cache(&v)?;
+        if let Err(error) = self.open_image_cache(&v) {
+            self.image_cache = None;
+            self.images.clear();
+            self.errors.push(UiEvent::Error(format!("身份已解锁，但图片缓存不可用：{error}。原文件已保留，文字聊天与普通文件仍可使用。")));
+        }
         self.my_pid = v.peer_id();
         let (cmd, evt) = net::spawn_multi(v.ed25519_seed(), v.x25519_pub());
         self.multi = true;
@@ -1058,6 +1062,24 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn damaged_image_index_does_not_lock_user_out_of_text_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v");
+        let keyfile = tmp.path().join("kf");
+        let mut app = App::with_dir(dir.clone());
+        app.authenticate("test-password", keyfile.to_str().unwrap(), true).unwrap();
+        app.lock();
+        let index = dir.join("private-images/index.enc");
+        std::fs::write(&index, b"damaged").unwrap();
+        let state = app.authenticate("test-password", keyfile.to_str().unwrap(), false).unwrap();
+        assert!(!state.my_id.is_empty());
+        assert!(app.image_cache.is_none());
+        assert!(app.poll_events().iter().any(|event| matches!(event, UiEvent::Error(message) if message.contains("图片缓存不可用"))));
+        assert_eq!(std::fs::read(index).unwrap(), b"damaged");
+        app.lock();
+    }
+
     #[test]
     fn real_apps_exchange_image_into_encrypted_preview_cache() {
         use std::time::{Duration, Instant};
