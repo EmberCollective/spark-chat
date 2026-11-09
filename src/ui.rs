@@ -1,5 +1,5 @@
 //! Rust 与桌面界面共享的消息契约。界面通过 AppHooks 调用后端。
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UiMsg {
@@ -7,6 +7,14 @@ pub struct UiMsg {
     pub ts: i64,
     pub text: String,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiImage {
+    pub id: String,
+    pub own: bool,
+    pub ts: i64,
+    pub mime: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UiFile {
     #[serde(serialize_with = "id_string")]
@@ -38,6 +46,12 @@ pub enum NetPosKind {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum UiEvent {
+    Image(UiImage),
+    SessionEvent {
+        session_id: String,
+        event: Box<UiEvent>,
+    },
+    SessionsChanged(Vec<crate::app::InitialSession>),
     NetPosition(String),
     NetPositionKind {
         text: String,

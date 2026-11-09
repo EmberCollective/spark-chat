@@ -149,7 +149,7 @@
       check(input.value === "失败时保留草稿", "发送失败保留草稿");
       emit("History", []);
       document.getElementById("home-button").click();
-      check(!document.getElementById("resume-chat").hidden && document.getElementById("host").disabled && document.getElementById("join").disabled, "空聊天返回主页后仍可返回，已有连接时不重复拨号");
+      check(!document.getElementById("resume-chat").hidden && !document.getElementById("host").disabled && !document.getElementById("join").disabled, "已有会话可返回，同时允许建立其他会话");
       document.getElementById("resume-chat").click();
       const file = {
         id: "18446744073709551615",

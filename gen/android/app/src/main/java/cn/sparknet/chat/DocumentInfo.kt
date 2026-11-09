@@ -51,6 +51,19 @@ class DocumentInfo(private val activity: Activity): Plugin(activity) {
     } catch (error: Exception) { invoke.reject(error.message ?: "无法删除未完成文件") }
   }
   @Command
+  fun openLink(invoke: Invoke) {
+    try {
+      val value = invoke.parseArgs(DocumentArgs::class.java).uri
+      require(value.length <= 4096) { "链接过长" }
+      val uri = Uri.parse(value)
+      require(uri.scheme == "https" || uri.scheme == "http") { "只允许打开 HTTP 或 HTTPS 链接" }
+      require(!uri.host.isNullOrBlank() && uri.userInfo == null) { "链接地址无效" }
+      val intent = Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE)
+      activity.startActivity(intent)
+      invoke.resolve(JSObject())
+    } catch (error: Exception) { invoke.reject(error.message ?: "没有可打开链接的浏览器") }
+  }
+  @Command
   fun open(invoke: Invoke) {
     try {
       val uri = Uri.parse(invoke.parseArgs(DocumentArgs::class.java).uri)

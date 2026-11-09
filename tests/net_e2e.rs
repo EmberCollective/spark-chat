@@ -48,6 +48,9 @@ trait Tag {
 impl Tag for NetEvent {
     fn tag(&self) -> &'static str {
         match self {
+            NetEvent::PeerEvent { .. } => "PeerEvent",
+            NetEvent::ImageIncoming { .. } => "ImageIncoming",
+            NetEvent::ImageDelivered => "ImageDelivered",
             NetEvent::ListenCode { .. } => "ListenCode",
             NetEvent::PeerKey { .. } => "PeerKey",
             NetEvent::Connected(_) => "Connected",

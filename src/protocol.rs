@@ -174,3 +174,17 @@ mod tests {
         assert!(decode_conn_code("SPARK-中文不是连接码").is_err());
     }
 }
+
+/// Independently versioned forum objects; existing chat frames are unchanged.
+pub mod forum;
+/// 独立图片协议；旧聊天 Frame 编码保持不变。
+#[derive(Debug, Clone)]
+pub struct ImageRequest {
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ImageReply {
+    Accepted,
+    Rejected(String),
+}

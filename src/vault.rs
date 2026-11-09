@@ -8,15 +8,15 @@
 //!        └────── MK = K1 XOR K2 ──────┘   （内存持有，永不落盘）
 //! MK 解锁「静态身份密钥」ed25519 seed（32B，以 AEAD(MK) 包裹落盘）
 //! 身份私钥 × 对方静态公钥(X25519) --> ECDH --> HKDF --> 每会话 DEK
-//! DEK + ChaCha20Poly1305 AEAD --> 加密每条消息记录（密文落盘）
+//! DEK + XChaCha20Poly1305 AEAD --> 加密新消息记录（旧 ChaCha20Poly1305 记录只读兼容）
 //! ```
 //!
 //! 落盘文件（vault_dir 下）：
 //! - vault.json     : {version, salt1, salt2, tag1, tag2, wrapped_seed, peer_registry}
 //!                    tag1/tag2 = Argon2 各自派生的校验标签（用于分辨是口令错还是 keyfile 错）
 //! - msgs-<会话指纹>.binl : 每行 = u32长度 + postcard(EncMsgRow)
-//!   EncMsgRow { nonce:[u8;12], ct:Vec<u8>, ts:i64, own:bool }
-//!   （加密内容 = 明文消息字符串；nonce 递增）
+//!   旧行 nonce 为 12B；新行长度高位标记格式，nonce 为 24B 随机值。
+//!   新旧行可混存，不重写旧密文；旧客户端会拒绝新行格式。
 //! - keyfile 由 create() 生成到用户指定路径（vault_dir 之外！），32 随机字节 hex 写入
 //!
 //! 解锁失败必须区分三类错误（UI 要如实展示）：
@@ -34,14 +34,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce};
+use fs2::FileExt;
 use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -83,13 +83,10 @@ impl From<std::io::Error> for VaultError {
 ///
 /// 一个 Session 对应「我和某个 peer 的聊天记录加密上下文」：
 /// - dek          ：ECDH+HKDF 派生的每会话数据密钥（双方一致）
-/// - nonce_prefix ：本 Session 打开的随机 4 字节前缀（见 store_msg 的 nonce 说明）
-/// - counter      ：会话内递增的消息计数（生成 nonce 用）
+/// 新消息使用 XChaCha20Poly1305 的随机 192 位 nonce，不依赖会话重开计数。
 pub struct Session {
     peer_id: String,
     dek: [u8; 32],
-    nonce_prefix: [u8; 4],
-    counter: AtomicU64,
 }
 
 /// 一条已解密的消息记录
@@ -152,6 +149,14 @@ struct EncMsgRow {
     own: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+struct EncMsgRowV2 {
+    nonce: [u8; 24],
+    ct: Vec<u8>,
+    ts: i64,
+    own: bool,
+}
+
 // ═══════════ 常量 ═══════════
 
 const VAULT_FILE: &str = "vault.json";
@@ -159,6 +164,8 @@ const VAULT_FILE: &str = "vault.json";
 const VERSION: u32 = 2;
 /// 单行消息上限 4MiB：防损坏文件里出现天文数字长度把内存读爆
 const MAX_ROW: usize = 4 * 1024 * 1024;
+// 旧格式长度最多 4 MiB，高位可无歧义地区分新行，旧客户端会明确拒绝。
+const XCHACHA_ROW: u32 = 1 << 31;
 
 /// AEAD 关联数据（AAD）标签——给「被包裹的种子」用。
 /// 两个 blob 用不同 AAD，攻击者就没法把 wrapped_ed 和 wrapped_x 对调位置。
@@ -168,24 +175,35 @@ const INFO_WRAP: &[u8] = b"spark-chat/wrap";
 const INFO_TAG1: &[u8] = b"spark-chat/tag1";
 const INFO_TAG2: &[u8] = b"spark-chat/tag2";
 const INFO_DEK: &[u8] = b"spark-chat/dek/v1";
+const INFO_MSG_V2: &[u8] = b"spark-chat/message/xchacha20poly1305/v2";
 
 impl Vault {
     /// 首次创建：生成身份密钥对（ed25519+x25519）、keyfile、vault.json。
     /// keyfile_path 是用户选择的另存位置（不在 vault_dir 内）。
     /// 返回 12D3KooW... 形式的 PeerId 字符串。
-    pub fn create(passphrase: &str, keyfile_path: &Path, vault_dir: &Path) -> Result<(Vault, String)> {
+    pub fn create(
+        passphrase: &str,
+        keyfile_path: &Path,
+        vault_dir: &Path,
+    ) -> Result<(Vault, String)> {
         Self::create_with_writer(passphrase, vault_dir, |content| {
             if let Some(parent) = keyfile_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(keyfile_path, content)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(keyfile_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
             Ok(())
         })
     }
 
     /// Android 使用系统文档 URI；只替换文件读写，密钥格式与密码学流程保持一致。
     pub fn create_with_writer(
-        passphrase: &str, vault_dir: &Path,
+        passphrase: &str,
+        vault_dir: &Path,
         write_keyfile: impl FnOnce(&str) -> Result<()>,
     ) -> Result<(Vault, String)> {
         // 已有库则拒绝覆盖——身份密钥一旦丢了就再也解不开旧消息，宁停勿滥
@@ -250,7 +268,8 @@ impl Vault {
     }
 
     pub fn unlock_with_reader(
-        passphrase: &str, vault_dir: &Path,
+        passphrase: &str,
+        vault_dir: &Path,
         read: impl FnOnce() -> Result<String>,
     ) -> Result<Vault> {
         // 1) 读 vault.json：文件缺失/JSON 解不开/版本不对 → 库本身坏了
@@ -339,6 +358,7 @@ impl Vault {
         if peer_id.is_empty() {
             return Err(VaultError::Other("peer_id 不能为空".into()));
         }
+        self.checked_shared_secret(x25519_pub)?;
         let mut file = self.lock_file()?;
         file.peer_registry
             .insert(peer_id.to_string(), hex_encode(x25519_pub));
@@ -358,7 +378,7 @@ impl Vault {
         let their_pub_bytes = hex32(&their_hex)?;
 
         // ── ECDH：x25519 静态-静态（Signal/Telegram 的 PreKey 简化版）──
-        let shared = self.x_secret.diffie_hellman(&XPublicKey::from(their_pub_bytes));
+        let shared = self.checked_shared_secret(&their_pub_bytes)?;
 
         // HKDF 盐 = 双方公钥排序拼接。排序是为了「谁先谁后」不影响结果，
         // 我和他独立各自计算也得到同一个 DEK——否则 A→B 和 B→A 会派生出两把钥匙。
@@ -372,45 +392,50 @@ impl Vault {
         salt[32..].copy_from_slice(&hi);
         let dek = hkdf32(shared.as_bytes(), Some(&salt), INFO_DEK);
 
-        // nonce 前缀随机化：见 store_msg 里的说明（防重启后计数器归零造成 nonce 重用）
-        let mut nonce_prefix = [0u8; 4];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_prefix);
-
         Ok(Session {
             peer_id: peer_id.to_string(),
             dek,
-            nonce_prefix,
-            counter: AtomicU64::new(0),
         })
     }
 
     /// 追加一条消息（加密落盘）
     pub fn store_msg(&self, s: &Session, own: bool, ts: i64, text: &str) -> Result<()> {
-        // nonce = [4B 随机会话前缀][8B 递增计数器]
-        // 为什么不每次纯随机 96 位？规格要求会话内递增；为什么不能从 0 纯递增？
-        // 因为 DEK 是静态 ECDH 派生的、跨重启不变，重启后计数器归零就会复用
-        // (key,nonce) —— AEAD 下这是灾难性错误。加 4 字节随机前缀（WireGuard 同款
-        // 思路）让每个 Session 的 nonce 空间互不重叠，计数器本会话内严格递增。
-        let n = s.counter.fetch_add(1, Ordering::Relaxed);
-        let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&s.nonce_prefix);
-        nonce[4..].copy_from_slice(&n.to_be_bytes());
+        if text.len() > MAX_ROW {
+            return Err(VaultError::Other("消息记录超过大小限制".into()));
+        }
+        // 192 位随机 nonce 适用于跨重启、并发句柄，不复用旧格式的 32 位随机空间。
+        let mut nonce = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
 
         // AAD 绑定明文元数据 (ts,own)：行内 ts/own 虽是明文，但被改动后解密必失败，
         // 时间戳不可伪造——「能看到几点发」和「能改几点发」是两回事。
         let aad = msg_aad(ts, own);
-        let ct = seal(&s.dek, &nonce, &aad, text.as_bytes());
+        let key = hkdf32(&s.dek, None, INFO_MSG_V2);
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("AEAD key 恒为 32B");
+        let ct = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: text.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| VaultError::Other("消息加密失败".into()))?;
 
-        let row = EncMsgRow { nonce, ct, ts, own };
-        let bytes =
-            postcard::to_allocvec(&row).map_err(|e| VaultError::Other(format!("序列化失败: {e}")))?;
+        let row = EncMsgRowV2 { nonce, ct, ts, own };
+        let bytes = postcard::to_allocvec(&row)
+            .map_err(|e| VaultError::Other(format!("序列化失败: {e}")))?;
 
+        if bytes.len() > MAX_ROW {
+            return Err(VaultError::Other("消息记录超过大小限制".into()));
+        }
         // 追加写：聊天记录只增不改，O(1) 落盘
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.msg_path(&s.peer_id))?;
-        f.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        FileExt::lock_exclusive(&f)?;
+        f.write_all(&((bytes.len() as u32) | XCHACHA_ROW).to_be_bytes())?;
         f.write_all(&bytes)?;
         Ok(())
     }
@@ -418,11 +443,16 @@ impl Vault {
     /// 读出全部消息（解密到内存）
     pub fn load_msgs(&self, s: &Session) -> Result<Vec<StoredMsg>> {
         let path = self.msg_path(&s.peer_id);
-        let data = match fs::read(&path) {
-            Ok(d) => d,
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()), // 新会话没历史
             Err(e) => return Err(VaultError::Io(e)),
         };
+
+        FileExt::lock_shared(&file)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        drop(file);
 
         let mut out = Vec::new();
         let mut off = 0usize;
@@ -434,7 +464,9 @@ impl Vault {
                     path.display()
                 )));
             }
-            let n = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+            let header =
+                u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+            let n = (header & !XCHACHA_ROW) as usize;
             if n == 0 || n > MAX_ROW {
                 return Err(VaultError::CorruptedVault(format!(
                     "{} 第 {} 条长度非法（{n}B）",
@@ -450,15 +482,37 @@ impl Vault {
                     out.len()
                 )));
             }
-            let row: EncMsgRow = postcard::from_bytes(&data[off..off + n])
-                .map_err(|e| VaultError::CorruptedVault(format!("第 {} 条反序列化失败: {e}", out.len())))?;
+            let bytes = &data[off..off + n];
+            let (pt, ts, own) = if header & XCHACHA_ROW != 0 {
+                let row: EncMsgRowV2 = postcard::from_bytes(bytes)
+                    .map_err(|e| VaultError::CorruptedVault(format!("新消息行解析失败: {e}")))?;
+                let key = hkdf32(&s.dek, None, INFO_MSG_V2);
+                let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("AEAD key 恒为 32B");
+                let pt = cipher
+                    .decrypt(
+                        XNonce::from_slice(&row.nonce),
+                        Payload {
+                            msg: &row.ct,
+                            aad: &msg_aad(row.ts, row.own),
+                        },
+                    )
+                    .map_err(|_| VaultError::CorruptedVault("新消息 AEAD 校验失败".into()))?;
+                (pt, row.ts, row.own)
+            } else {
+                let row: EncMsgRow = postcard::from_bytes(bytes)
+                    .map_err(|e| VaultError::CorruptedVault(format!("旧消息行解析失败: {e}")))?;
+                (
+                    open_seal(&s.dek, &row.nonce, &msg_aad(row.ts, row.own), &row.ct)?,
+                    row.ts,
+                    row.own,
+                )
+            };
             off += n;
 
-            let pt = open_seal(&s.dek, &row.nonce, &msg_aad(row.ts, row.own), &row.ct)?;
             let text = String::from_utf8(pt).map_err(|_| {
                 VaultError::CorruptedVault(format!("第 {} 条解出的不是 UTF-8 文本", out.len()))
             })?;
-            out.push(StoredMsg { ts: row.ts, own: row.own, text });
+            out.push(StoredMsg { ts, own, text });
         }
         Ok(out)
     }
@@ -523,6 +577,14 @@ impl Vault {
     }
 
     // ── 内部工具 ──
+
+    fn checked_shared_secret(&self, their_pub: &[u8; 32]) -> Result<x25519_dalek::SharedSecret> {
+        let shared = self.x_secret.diffie_hellman(&XPublicKey::from(*their_pub));
+        if !shared.was_contributory() {
+            return Err(VaultError::Other("拒绝无效的 X25519 公钥".into()));
+        }
+        Ok(shared)
+    }
 
     fn lock_file(&self) -> Result<MutexGuard<'_, VaultFile>> {
         self.file
@@ -720,7 +782,10 @@ mod tests {
     /// 造一个「对方」：随机的 x25519 公钥 + 假 PeerId 字符串
     fn fake_peer() -> ([u8; 32], String) {
         let sk = XStaticSecret::from(rand32());
-        (XPublicKey::from(&sk).to_bytes(), "12D3KooQFakePeerForTest0123456789".to_string())
+        (
+            XPublicKey::from(&sk).to_bytes(),
+            "12D3KooQFakePeerForTest0123456789".to_string(),
+        )
     }
 
     fn unlocked(pass: &str, keyfile: &Path, vault_dir: &Path) -> Vault {
@@ -728,25 +793,129 @@ mod tests {
     }
 
     #[test]
+    fn create_preserves_existing_keyfile() {
+        let (_tmp, dir, keyfile) = setup();
+        fs::write(&keyfile, b"existing key material").unwrap();
+        assert!(
+            matches!(Vault::create("pw", &keyfile, &dir), Err(VaultError::Io(e))
+            if e.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(fs::read(&keyfile).unwrap(), b"existing key material");
+        assert!(!dir.join(VAULT_FILE).exists());
+    }
+
+    #[test]
+    fn rejects_non_contributory_peers_before_registration_and_session() {
+        let (_tmp, dir, keyfile) = setup();
+        let (vault, _) = Vault::create("pw", &keyfile, &dir).unwrap();
+        let before = fs::read(dir.join(VAULT_FILE)).unwrap();
+        for first in [0, 1] {
+            let mut low_order = [0; 32];
+            low_order[0] = first;
+            assert!(vault.register_peer("bad", &low_order).is_err());
+            assert_eq!(fs::read(dir.join(VAULT_FILE)).unwrap(), before);
+            // 已存在的异常注册项也必须在读取会话时拒绝。
+            vault
+                .lock_file()
+                .unwrap()
+                .peer_registry
+                .insert("bad".into(), hex_encode(&low_order));
+            assert!(vault.open_session("bad").is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_legacy_and_new_rows_survive_reopen_without_rewriting_history() {
+        let (_tmp, dir, keyfile) = setup();
+        let (vault, _) = Vault::create("pw", &keyfile, &dir).unwrap();
+        let (peer_pub, peer) = fake_peer();
+        vault.register_peer(&peer, &peer_pub).unwrap();
+        let session = vault.open_session(&peer).unwrap();
+        let nonce = [7; 12];
+        let old = EncMsgRow {
+            nonce,
+            ct: seal(&session.dek, &nonce, &msg_aad(1, true), b"legacy"),
+            ts: 1,
+            own: true,
+        };
+        let row = postcard::to_allocvec(&old).unwrap();
+        let mut legacy = (row.len() as u32).to_be_bytes().to_vec();
+        legacy.extend(row);
+        let path = vault.msg_path(&peer);
+        fs::write(&path, &legacy).unwrap();
+        for i in 0..8 {
+            vault
+                .store_msg(&vault.open_session(&peer).unwrap(), false, i + 2, "new")
+                .unwrap();
+        }
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&legacy), "旧密文不得被迁移覆盖");
+        let mut off = legacy.len();
+        let mut nonces = std::collections::HashSet::new();
+        while off < bytes.len() {
+            let header = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap());
+            assert_ne!(header & XCHACHA_ROW, 0);
+            off += 4;
+            let n = (header & !XCHACHA_ROW) as usize;
+            let row: EncMsgRowV2 = postcard::from_bytes(&bytes[off..off + n]).unwrap();
+            assert!(nonces.insert(row.nonce));
+            off += n;
+        }
+        assert_eq!(nonces.len(), 8);
+        drop(vault);
+        let opened = unlocked("pw", &keyfile, &dir);
+        let session = opened.open_session(&peer).unwrap();
+        let messages = opened.load_msgs(&session).unwrap();
+        assert_eq!(messages.len(), 9);
+        assert_eq!(messages[0].text, "legacy");
+        assert!(messages[1..].iter().all(|m| m.text == "new"));
+        // 新行密文损坏不得退回旧格式尝试或静默吞掉。
+        let header = u32::from_be_bytes(bytes[legacy.len()..legacy.len() + 4].try_into().unwrap());
+        let n = (header & !XCHACHA_ROW) as usize;
+        let start = legacy.len() + 4;
+        let mut row: EncMsgRowV2 = postcard::from_bytes(&bytes[start..start + n]).unwrap();
+        row.ct[0] ^= 1;
+        let mut tampered = bytes;
+        tampered[start..start + n].copy_from_slice(&postcard::to_allocvec(&row).unwrap());
+        fs::write(&path, tampered).unwrap();
+        assert!(matches!(
+            opened.load_msgs(&session),
+            Err(VaultError::CorruptedVault(_))
+        ));
+    }
+
+    #[test]
     fn document_keyfile_roundtrip_and_failed_export() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("vault");
         let failed = Vault::create_with_writer("test-pass", &dir, |_| {
-            Err(VaultError::Io(std::io::Error::other("document write failed")))
+            Err(VaultError::Io(std::io::Error::other(
+                "document write failed",
+            )))
         });
         assert!(failed.is_err());
         assert!(!dir.join(VAULT_FILE).exists());
         let mut document = String::new();
         let (created, _) = Vault::create_with_writer("test-pass", &dir, |text| {
-            document = text.to_owned(); Ok(())
-        }).unwrap();
-        let opened = Vault::unlock_with_reader("test-pass", &dir, || Ok(format!(" {document}\n"))).unwrap();
+            document = text.to_owned();
+            Ok(())
+        })
+        .unwrap();
+        let opened =
+            Vault::unlock_with_reader("test-pass", &dir, || Ok(format!(" {document}\n"))).unwrap();
         assert_eq!(created.peer_id(), opened.peer_id());
         let disk = temp.path().join("backup");
         fs::write(&disk, &document).unwrap();
-        assert_eq!(Vault::unlock("test-pass", &disk, &dir).unwrap().peer_id(), created.peer_id());
+        assert_eq!(
+            Vault::unlock("test-pass", &disk, &dir).unwrap().peer_id(),
+            created.peer_id()
+        );
         let mut wrote = false;
-        assert!(Vault::create_with_writer("other", &dir, |_| { wrote=true; Ok(()) }).is_err());
+        assert!(Vault::create_with_writer("other", &dir, |_| {
+            wrote = true;
+            Ok(())
+        })
+        .is_err());
         assert!(!wrote, "已有库时不得覆盖文档中的钥匙");
     }
 
@@ -757,7 +926,10 @@ mod tests {
         drop(vault);
         let again = unlocked("correct horse", &keyfile, &vault_dir);
         // PeerId 形如 12D3KooW...（ed25519 公钥的 identity multihash，base58 编码）
-        assert!(peer_id.starts_with("12D3KooW"), "PeerId 形态不对: {peer_id}");
+        assert!(
+            peer_id.starts_with("12D3KooW"),
+            "PeerId 形态不对: {peer_id}"
+        );
         assert_eq!(again.peer_id(), peer_id, "同一种子必须得到同一 PeerId");
     }
 
@@ -844,7 +1016,7 @@ mod tests {
         vault.store_msg(&s, true, 2000, "在，啥事").unwrap();
         vault.store_msg(&s, true, 3000, "顺便发你个文件").unwrap();
 
-        // 故意重新 open_session：新 Session 的 nonce 前缀不同，
+        // 故意重新 open_session：消息解密不依赖新 Session 的随机状态，
         // 证明解密用的是每行存的 nonce，而不是会话内存状态
         let s2 = vault.open_session(&peer_id).unwrap();
         let msgs = vault.load_msgs(&s2).unwrap();
@@ -861,7 +1033,9 @@ mod tests {
         let (peer_pub, peer_id) = fake_peer();
         vault.register_peer(&peer_id, &peer_pub).unwrap();
         let s = vault.open_session(&peer_id).unwrap();
-        vault.store_msg(&s, false, 111, "考试答案：第三章 42，别外传").unwrap();
+        vault
+            .store_msg(&s, false, 111, "考试答案：第三章 42，别外传")
+            .unwrap();
         vault.store_msg(&s, true, 222, "收到，看完就删").unwrap();
 
         // 直接读 msgs-*.binl 的原始字节，确认明文不在里面
@@ -873,7 +1047,11 @@ mod tests {
         assert_eq!(binl.len(), 1, "应有且仅有一个会话消息文件");
         let bytes = fs::read(&binl[0]).unwrap();
         assert!(!bytes.is_empty());
-        for secret in ["考试答案".as_bytes(), "别外传".as_bytes(), "看完就删".as_bytes()] {
+        for secret in [
+            "考试答案".as_bytes(),
+            "别外传".as_bytes(),
+            "看完就删".as_bytes(),
+        ] {
             assert!(
                 !bytes.windows(secret.len()).any(|w| w == secret),
                 "明文泄漏进了 {}",
@@ -886,7 +1064,9 @@ mod tests {
             assert!(!b.windows(12).any(|w| w == "考试答案".as_bytes()));
         }
         // 但解密路径仍能完整读回（密文验证的另一面）
-        let msgs = vault.load_msgs(&vault.open_session(&peer_id).unwrap()).unwrap();
+        let msgs = vault
+            .load_msgs(&vault.open_session(&peer_id).unwrap())
+            .unwrap();
         assert_eq!(msgs[0].text, "考试答案：第三章 42，别外传");
         let _ = tmp; // 仅保活临时目录
     }
@@ -906,7 +1086,9 @@ mod tests {
             vault.change_passphrase("nope", "new-pw", &keyfile),
             Err(VaultError::WrongPassphrase)
         ));
-        vault.change_passphrase("old-pw", "new-pw", &keyfile).unwrap();
+        vault
+            .change_passphrase("old-pw", "new-pw", &keyfile)
+            .unwrap();
 
         // 旧口令解不开了，新口令可以
         assert!(matches!(
@@ -964,8 +1146,10 @@ mod tests {
         // 这是端到端加密成立的前提，单独一侧的 roundtrip 测不出来。
         let tmp_a = tempfile::tempdir().unwrap();
         let tmp_b = tempfile::tempdir().unwrap();
-        let (a, _) = Vault::create("pa", &tmp_a.path().join("kf"), &tmp_a.path().join("v")).unwrap();
-        let (b, _) = Vault::create("pb", &tmp_b.path().join("kf"), &tmp_b.path().join("v")).unwrap();
+        let (a, _) =
+            Vault::create("pa", &tmp_a.path().join("kf"), &tmp_a.path().join("v")).unwrap();
+        let (b, _) =
+            Vault::create("pb", &tmp_b.path().join("kf"), &tmp_b.path().join("v")).unwrap();
         a.register_peer(&b.peer_id(), &b.x25519_pub()).unwrap();
         b.register_peer(&a.peer_id(), &a.x25519_pub()).unwrap();
 

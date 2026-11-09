@@ -9,7 +9,7 @@
 //! Frame::Text{seq:0, ts:0, text:"@HELLO <x25519公钥hex>"}；
 //! net 层拦截不上抛 UI，解析出对方 x25519 公钥后发 NetEvent::PeerKey。
 
-use crate::protocol::{self, ConnectInfo, Frame, CHUNK_SIZE};
+use crate::protocol::{self, ConnectInfo, Frame, ImageRequest, ImageReply, CHUNK_SIZE};
 use crate::transfer::ReceiveTarget;
 use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -39,6 +39,10 @@ const MAX_INCOMING: usize = 2;
 #[derive(Debug)]
 pub enum NetCmd {
     StartListen,
+    Ready,
+    SendImage(Vec<u8>),
+    ImageResult { id: u64, result: Result<(), String> },
+    To { peer_id: String, command: Box<NetCmd> },
     Dial(String),
     SendText(String),
     SendFile(PathBuf),
@@ -46,11 +50,15 @@ pub enum NetCmd {
     SendOpenedFile { name: String, file: std::fs::File },
     AcceptFile { id: u64, target: ReceiveTarget },
     RejectFile { id: u64 },
+    Disconnect,
     Shutdown,
 }
 
 #[derive(Debug)]
 pub enum NetEvent {
+    ImageDelivered,
+    ImageIncoming { id: u64, bytes: Vec<u8> },
+    PeerEvent { peer_id: String, event: Box<NetEvent> },
     ListenCode {
         code: String,
         verify: String,
@@ -102,6 +110,14 @@ pub fn spawn(
     ed25519_seed: [u8; 32],
     my_x25519_pub: [u8; 32],
 ) -> (mpsc::Sender<NetCmd>, mpsc::Receiver<NetEvent>) {
+    spawn_mode(ed25519_seed, my_x25519_pub, false)
+}
+
+pub fn spawn_multi(ed25519_seed: [u8; 32], my_x25519_pub: [u8; 32]) -> (mpsc::Sender<NetCmd>, mpsc::Receiver<NetEvent>) {
+    spawn_mode(ed25519_seed, my_x25519_pub, true)
+}
+
+fn spawn_mode(ed25519_seed: [u8; 32], my_x25519_pub: [u8; 32], multi: bool) -> (mpsc::Sender<NetCmd>, mpsc::Receiver<NetEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<NetCmd>();
     let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
     std::thread::Builder::new()
@@ -112,7 +128,7 @@ pub fn spawn(
                 .enable_all()
                 .build()
                 .expect("tokio runtime 创建失败");
-            rt.block_on(async_main(ed25519_seed, my_x25519_pub, cmd_rx, evt_tx));
+            rt.block_on(async_main(ed25519_seed, my_x25519_pub, cmd_rx, evt_tx, multi));
         })
         .expect("网络线程启动失败");
     (cmd_tx, evt_rx)
@@ -178,7 +194,93 @@ impl RRCodec for FrameCodec {
     }
 }
 
-type Swarm = libp2p::Swarm<RR<FrameCodec>>;
+#[derive(libp2p::swarm::NetworkBehaviour)]
+struct Behaviour {
+    chat: RR<FrameCodec>,
+    images: RR<ImageCodec>,
+}
+type Swarm = libp2p::Swarm<Behaviour>;
+
+#[derive(Clone)]
+struct ImageCodec;
+async fn image_read<T: AsyncRead + Unpin + Send>(io: &mut T, limit: usize) -> io::Result<Vec<u8>> {
+    let mut size = [0; 4];
+    io.read_exact(&mut size).await?;
+    let size = u32::from_be_bytes(size) as usize;
+    if size == 0 || size > limit { return Err(io::Error::other("图片协议长度无效")); }
+    let mut bytes = vec![0; size];
+    io.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+async fn image_write<T: AsyncWrite + Unpin + Send>(io: &mut T, bytes: &[u8], limit: usize) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() > limit { return Err(io::Error::other("图片协议长度无效")); }
+    io.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    io.write_all(bytes).await?;
+    io.close().await
+}
+#[async_trait]
+impl RRCodec for ImageCodec {
+    type Protocol = StreamProtocol;
+    type Request = ImageRequest;
+    type Response = ImageReply;
+    async fn read_request<T: AsyncRead + Unpin + Send>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<ImageRequest> {
+        Ok(ImageRequest { data: image_read(io, crate::images::MAX_IMAGE_BYTES).await? })
+    }
+    async fn read_response<T: AsyncRead + Unpin + Send>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<ImageReply> {
+        postcard::from_bytes(&image_read(io, 1024).await?).map_err(|e| io::Error::other(e.to_string()))
+    }
+    async fn write_request<T: AsyncWrite + Unpin + Send>(&mut self, _: &Self::Protocol, io: &mut T, request: ImageRequest) -> io::Result<()> {
+        image_write(io, &request.data, crate::images::MAX_IMAGE_BYTES).await
+    }
+    async fn write_response<T: AsyncWrite + Unpin + Send>(&mut self, _: &Self::Protocol, io: &mut T, response: ImageReply) -> io::Result<()> {
+        image_write(io, &postcard::to_allocvec(&response).map_err(|e| io::Error::other(e.to_string()))?, 1024).await
+    }
+}
+
+const MAX_PEERS: usize = 8;
+
+struct EventSink { sender: mpsc::Sender<NetEvent>, peer: Option<PeerId> }
+impl EventSink {
+    fn send(&self, event: NetEvent) -> Result<(), mpsc::SendError<NetEvent>> {
+        self.sender.send(match self.peer {
+            Some(peer) => NetEvent::PeerEvent { peer_id: peer.to_string(), event: Box::new(event) },
+            None => event,
+        })
+    }
+}
+
+struct PeerState {
+    peer: Option<PeerId>,
+    pending_dial: Option<(ConnectInfo, usize)>,
+    next_seq: u64,
+    incoming: HashMap<u64, IncomingFile>,
+    outgoing: Option<OutgoingFile>,
+    texts: OutgoingTexts,
+    preparing: Option<u64>,
+    ready: bool,
+    image_in: Option<(u64, libp2p::request_response::ResponseChannel<ImageReply>, std::time::Instant)>,
+    image_out: Option<libp2p::request_response::OutboundRequestId>,
+}
+impl Default for PeerState {
+    fn default() -> Self { Self { peer: None, pending_dial: None, next_seq: 1, incoming: HashMap::new(), outgoing: None, texts: OutgoingTexts::default(), preparing: None, ready: false, image_in: None, image_out: None } }
+}
+
+type PreparedFile = Result<(std::fs::File, u64, String, String), String>;
+enum Action {
+    Command(NetCmd),
+    Network(SwarmEvent<BehaviourEvent>),
+    Prepared(PeerId, u64, PreparedFile),
+    Tick(PeerId),
+}
+fn event_peer(event: &SwarmEvent<BehaviourEvent>) -> Option<PeerId> {
+    match event {
+        SwarmEvent::ConnectionEstablished { peer_id, .. } | SwarmEvent::ConnectionClosed { peer_id, .. } => Some(*peer_id),
+        SwarmEvent::OutgoingConnectionError { peer_id, .. } => *peer_id,
+        SwarmEvent::Behaviour(BehaviourEvent::Chat(RREvent::Message { peer, .. } | RREvent::OutboundFailure { peer, .. } | RREvent::InboundFailure { peer, .. } | RREvent::ResponseSent { peer, .. })) => Some(*peer),
+        SwarmEvent::Behaviour(BehaviourEvent::Images(RREvent::Message { peer, .. } | RREvent::OutboundFailure { peer, .. } | RREvent::InboundFailure { peer, .. } | RREvent::ResponseSent { peer, .. })) => Some(*peer),
+        _ => None,
+    }
+}
 
 // ── 主循环 ──
 
@@ -187,6 +289,7 @@ async fn async_main(
     my_x25519_pub: [u8; 32],
     cmd_rx: mpsc::Receiver<NetCmd>,
     evt_tx: mpsc::Sender<NetEvent>,
+    multi: bool,
 ) {
     // std mpsc → tokio mpsc 桥：UI 线程无阻塞发命令，async 侧统一 select
     let (tcmd_tx, mut tcmd_rx) = tokio::sync::mpsc::channel::<NetCmd>(16);
@@ -215,13 +318,17 @@ async fn async_main(
                 std::iter::once((StreamProtocol::new(PROTOCOL_NAME), ProtocolSupport::Full));
             // 文件分块走请求，大文件给足请求超时
             let cfg = RRConfig::default().with_request_timeout(Duration::from_secs(300));
-            RR::with_codec(FrameCodec, protocols, cfg)
+            Behaviour {
+                chat: RR::with_codec(FrameCodec, protocols, cfg),
+                images: RR::with_codec(ImageCodec, [(StreamProtocol::new("/spark-chat/image/1"), ProtocolSupport::Full)], RRConfig::default().with_request_timeout(Duration::from_secs(60)).with_max_concurrent_streams(2)),
+            }
         })
         .expect("request-response 构造失败")
         // 桌面聊天的停顿不应触发默认 10 秒空闲断线。
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(24 * 60 * 60)))
         .build();
 
+    let mut evt_tx = EventSink { sender: evt_tx, peer: None };
     let my_id = *swarm.local_peer_id();
     let hello_text = format!(
         "{HELLO_PREFIX}{}",
@@ -231,34 +338,65 @@ async fn async_main(
             .collect::<String>()
     );
 
-    let mut peer: Option<PeerId> = None;
-    let mut pending_dial: Option<(ConnectInfo, usize)> = None; // (候选信息, 下一个待试下标)
+    let mut states: HashMap<PeerId, PeerState> = HashMap::new();
+    let mut legacy_peer = None;
     let mut file_id_seed: u64 = 1;
-    let mut next_seq: u64 = 1;
     let mut listening = false;
-    // 接收中的文件：id -> (名字, 总长, 数据缓冲)；外加期望的 sha256
-    let mut incoming: HashMap<u64, IncomingFile> = HashMap::new();
-    let mut outgoing: Option<OutgoingFile> = None;
-    let mut texts = OutgoingTexts::default();
     let (prepared_tx, mut prepared_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut preparing: Option<u64> = None;
     let mut timer = tokio::time::interval(Duration::from_secs(1));
+    let mut ticks = VecDeque::new();
     let port: u16 = std::env::var("SPARK_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
     loop {
-        tokio::select! {
-            maybe_cmd = tcmd_rx.recv() => {
-                let Some(cmd) = maybe_cmd else { break };
+        let action = if let Some(p) = ticks.pop_front() { Action::Tick(p) } else {
+            tokio::select! {
+                cmd = tcmd_rx.recv() => match cmd { Some(cmd) => Action::Command(cmd), None => break },
+                ev = swarm.select_next_some() => Action::Network(ev),
+                Some((p, id, result)) = prepared_rx.recv() => Action::Prepared(p, id, result),
+                _ = timer.tick() => { ticks.extend(states.keys().copied()); continue; }
+            }
+        };
+        if let Action::Command(NetCmd::To { peer_id, command }) = &action {
+            let valid = peer_id.parse::<PeerId>().ok().is_some_and(|id| states.get(&id).is_some_and(|state| state.peer.is_some()));
+            if !valid || matches!(command.as_ref(), NetCmd::To { .. } | NetCmd::StartListen | NetCmd::Dial(_) | NetCmd::Shutdown) {
+                evt_tx.peer = None;
+                let _ = evt_tx.send(NetEvent::Error("目标会话未连接或命令无效".into()));
+                continue;
+            }
+        }
+        let target = match &action {
+            Action::Command(NetCmd::StartListen | NetCmd::Shutdown) => None,
+            Action::Command(NetCmd::Dial(code)) => protocol::decode_conn_code(code.trim()).ok().and_then(|i| i.peer_id.parse().ok()),
+            Action::Command(NetCmd::To { peer_id, .. }) => peer_id.parse().ok(),
+            Action::Network(ev) => event_peer(ev),
+            Action::Prepared(p, ..) | Action::Tick(p) => Some(*p),
+            _ => legacy_peer,
+        };
+        if let Some(p) = target {
+            if !states.contains_key(&p) && states.len() >= MAX_PEERS {
+                let _ = swarm.disconnect_peer_id(p);
+                evt_tx.peer = None;
+                let _ = evt_tx.send(NetEvent::Error("同时最多连接 8 个聊天对象，请断开一个连接后重试".into()));
+                continue;
+            }
+        }
+        evt_tx.peer = if multi { target } else { None };
+        let mut state = target.and_then(|p| states.remove(&p)).unwrap_or_default();
+        let PeerState { mut peer, mut pending_dial, mut next_seq, mut incoming, mut outgoing, mut texts, mut preparing, mut ready, mut image_in, mut image_out } = state;
+        'dispatch: {
+        match action {
+            Action::Command(cmd) => {
+                let cmd = match cmd { NetCmd::To { command, .. } => *command, other => other };
                 let cmd = match cmd {
                     NetCmd::SendFile(path) => match std::fs::File::open(&path) {
                         Ok(file) => NetCmd::SendOpenedFile {
                             name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into()),
                             file,
                         },
-                        Err(e) => { let _ = evt_tx.send(NetEvent::Error(format!("读文件失败：{e}"))); continue; }
+                        Err(e) => { let _ = evt_tx.send(NetEvent::Error(format!("读文件失败：{e}"))); break 'dispatch; }
                     },
                     other => other,
                 };
@@ -268,7 +406,7 @@ async fn async_main(
                         if !listening {
                             if let Err(e) = swarm.listen_on(listen_ma) {
                                 let _ = evt_tx.send(NetEvent::Error(format!("监听 {port} 失败：{e}（换端口：设 SPARK_PORT 环境变量）")));
-                                continue;
+                                break 'dispatch;
                             }
                             listening = true;
                         }
@@ -292,17 +430,17 @@ async fn async_main(
                     NetCmd::Dial(code) => {
                         if peer.is_some() {
                             let _ = evt_tx.send(NetEvent::Error("当前已连接好友，请返回聊天；更换好友前请先锁定再解锁".into()));
-                            continue;
+                            break 'dispatch;
                         }
                         match protocol::decode_conn_code(code.trim()) {
                             Ok(info) => {
                                 let Ok(target) = info.peer_id.parse::<PeerId>() else {
                                     let _ = evt_tx.send(NetEvent::Error("口令码里的身份信息无效，请重新复制整段".into()));
-                                    continue;
+                                    break 'dispatch;
                                 };
                                 if info.addrs.is_empty() {
                                     let _ = evt_tx.send(NetEvent::Error("口令码里没有可用地址".into()));
-                                    continue;
+                                    break 'dispatch;
                                 }
                                 // 逐个尝试：先拨第一个，失败轮换（见 OutgoingConnectionError 分支）
                                 if let Some(idx) = try_dial(&mut swarm, &info, 0, target) {
@@ -329,64 +467,83 @@ async fn async_main(
                     NetCmd::SendOpenedFile { name, file } => {
                         let Some(_) = peer else {
                             let _ = evt_tx.send(NetEvent::Error("还没连上对方，文件发不出去".into()));
-                            continue;
+                            break 'dispatch;
                         };
                         if outgoing.is_some() {
                             let _ = evt_tx.send(NetEvent::Error("已有文件正在发送，请完成后再选下一个".into()));
-                            continue;
+                            break 'dispatch;
                         }
                         let id = file_id_seed; file_id_seed += 1;
-                        if preparing.is_some() { let _ = evt_tx.send(NetEvent::Error("已有文件正在准备，请稍后再发".into())); continue; }
+                        if preparing.is_some() { let _ = evt_tx.send(NetEvent::Error("已有文件正在准备，请稍后再发".into())); break 'dispatch; }
                         let size = match file.metadata() {
                             Ok(m) if m.is_file() && m.len() <= i64::MAX as u64 => m.len(),
-                            _ => { let _ = evt_tx.send(NetEvent::Error("无法读取文件大小，请选择本机普通文件".into())); continue; }
+                            _ => { let _ = evt_tx.send(NetEvent::Error("无法读取文件大小，请选择本机普通文件".into())); break 'dispatch; }
                         };
                         preparing = Some(id);
                         let _ = evt_tx.send(NetEvent::FileOutgoing { id, name: name.clone(), size });
                         let tx = prepared_tx.clone();
+                        let prepared_peer = peer.unwrap();
                         tokio::task::spawn_blocking(move || {
                             let result = prepare_file(file, size).map(|(file, sha)| (file, size, name, sha));
-                            let _ = tx.send((id, result));
+                            let _ = tx.send((prepared_peer, id, result));
                         });
                     }
                     NetCmd::AcceptFile { id, target } => {
                         if let Some(f) = incoming.get_mut(&id) {
-                            if f.target.is_some() { continue; }
+                            if f.target.is_some() { break 'dispatch; }
                             f.target = Some(target);
                             f.updated = std::time::Instant::now();
-                            if let Some(channel) = f.channel.take() { let _ = swarm.behaviour_mut().send_response(channel, ()); }
+                            if let Some(channel) = f.channel.take() { let _ = swarm.behaviour_mut().chat.send_response(channel, ()); }
                             let _ = evt_tx.send(NetEvent::FileProgress { id, done: 0, total: f.size });
                             if f.size == 0 { finish_incoming(id, &mut incoming, &evt_tx, &mut swarm, peer.unwrap()); }
                         }
                     }
                     NetCmd::RejectFile { id } => {
                         if release_incoming(id, &mut incoming, &mut swarm).is_some() {
-                            if let Some(p) = peer { swarm.behaviour_mut().send_request(&p, Frame::FileReject { id, reason: "接收方已取消接收".into() }); }
+                            if let Some(p) = peer { swarm.behaviour_mut().chat.send_request(&p, Frame::FileReject { id, reason: "接收方已取消接收".into() }); }
                             let _ = evt_tx.send(NetEvent::FileFailed { id, outgoing: false, reason: "已取消接收".into() });
                         }
                     }
-                    NetCmd::Shutdown => break,
+                    NetCmd::Ready => { ready = peer.is_some(); },
+                    NetCmd::SendImage(bytes) => {
+                        if !ready || image_out.is_some() || bytes.is_empty() || bytes.len() > crate::images::MAX_IMAGE_BYTES {
+                            let _ = evt_tx.send(NetEvent::Error("图片未发送：会话未就绪、已有图片在发送或超过大小限制".into()));
+                        } else if let Some(p) = peer {
+                            image_out = Some(swarm.behaviour_mut().images.send_request(&p, ImageRequest { data: bytes }));
+                        }
+                    },
+                    NetCmd::ImageResult { id, result } => {
+                        if image_in.as_ref().is_some_and(|(pending,_,_)| *pending == id) {
+                            let (_, channel, _) = image_in.take().unwrap();
+                            let reply = match result { Ok(()) => ImageReply::Accepted, Err(error) => ImageReply::Rejected(error.chars().take(200).collect()) };
+                            let _ = swarm.behaviour_mut().images.send_response(channel, reply);
+                        }
+                    },
+                    NetCmd::Disconnect => { if let Some(p) = peer { let _ = swarm.disconnect_peer_id(p); } },
+                    NetCmd::Shutdown => return,
+                    NetCmd::To { .. } => { let _ = evt_tx.send(NetEvent::Error("嵌套会话命令无效".into())); },
                 }
             }
-            ev = swarm.select_next_some() => {
+            Action::Network(ev) => {
                 match ev {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        if peer.is_some() && peer != Some(peer_id) {
+                        if !multi && legacy_peer.is_some() && legacy_peer != Some(peer_id) {
                             let _ = swarm.disconnect_peer_id(peer_id);
-                            continue;
+                            break 'dispatch;
                         }
-                        if peer == Some(peer_id) { continue; }
+                        if peer == Some(peer_id) { break 'dispatch; }
                         pending_dial = None;
                         peer = Some(peer_id);
+                        legacy_peer = Some(peer_id);
                         // 立即互发 @HELLO（内联控制帧，交换 x25519 静态公钥）
-                        swarm.behaviour_mut().send_request(&peer_id, Frame::Text {
+                        swarm.behaviour_mut().chat.send_request(&peer_id, Frame::Text {
                             seq: 0, ts: 0, text: hello_text.clone(),
                         });
                         let _ = evt_tx.send(NetEvent::Connected(peer_id.to_string()));
                     }
                     SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
                         if num_established == 0 && Some(peer_id) == peer {
-                            peer = None; incoming.clear(); outgoing = None; preparing = None;
+                            peer = None; incoming.clear(); outgoing = None; preparing = None; ready = false; image_in = None; image_out = None;
                             let queued = texts.clear();
                             if queued > 0 { let _ = evt_tx.send(NetEvent::Error(format!("连接断开，{queued} 条排队消息未确认发送，请重连后检查并重发"))); }
                             let _ = evt_tx.send(NetEvent::Disconnected(
@@ -406,7 +563,7 @@ async fn async_main(
                                 if let Ok(target) = info.peer_id.parse::<PeerId>() {
                                     if let Some(idx) = try_dial(&mut swarm, &info, next, target) {
                                         pending_dial = Some((info, idx));
-                                        continue;
+                                        break 'dispatch;
                                     }
                                 }
                             }
@@ -414,18 +571,18 @@ async fn async_main(
                             let _ = evt_tx.send(NetEvent::Error(format!("所有地址都连不上：{error}。请确认对方在线/在同一校园网")));
                         }
                     }
-                    SwarmEvent::Behaviour(RREvent::Message { peer: peer_id, message: Message::Request { request, channel, .. }, .. }) => {
-                        if Some(peer_id) != peer { continue; }
+                    SwarmEvent::Behaviour(BehaviourEvent::Chat(RREvent::Message { peer: peer_id, message: Message::Request { request, channel, .. }, .. })) => {
+                        if Some(peer_id) != peer { break 'dispatch; }
                         if let Frame::FileMeta { id, name, size, sha256 } = request {
                             if incoming.len() >= MAX_INCOMING || incoming.contains_key(&id) || size > i64::MAX as u64 || name.len() > 1024 || sha256.len() != 64 || !sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
-                                let _ = swarm.behaviour_mut().send_response(channel, ());
-                                swarm.behaviour_mut().send_request(&peer_id, Frame::FileReject { id, reason: "接收任务已满或文件信息无效".into() });
-                                continue;
+                                let _ = swarm.behaviour_mut().chat.send_response(channel, ());
+                                swarm.behaviour_mut().chat.send_request(&peer_id, Frame::FileReject { id, reason: "接收任务已满或文件信息无效".into() });
+                                break 'dispatch;
                             }
                             incoming.insert(id, IncomingFile { name: name.clone(), size, sha: sha256, target: None, hasher: Sha256::new(), received: 0, next: 0, channel: Some(channel), updated: std::time::Instant::now() });
                             let _ = evt_tx.send(NetEvent::FileIncoming { id, name, size });
                         } else {
-                            let _ = swarm.behaviour_mut().send_response(channel, ());
+                            let _ = swarm.behaviour_mut().chat.send_response(channel, ());
                             if let Frame::FileReject { id, reason } = &request {
                                 if outgoing.as_ref().is_some_and(|f| f.id == *id) { outgoing = None; let _ = evt_tx.send(NetEvent::FileFailed { id: *id, outgoing: true, reason: reason.clone() }); }
                             }
@@ -438,7 +595,7 @@ async fn async_main(
                             handle_frame(request, peer_id, &mut incoming, &evt_tx, &mut swarm);
                         }
                     }
-                    SwarmEvent::Behaviour(RREvent::Message { message: Message::Response { request_id, .. }, .. }) => {
+                    SwarmEvent::Behaviour(BehaviourEvent::Chat(RREvent::Message { message: Message::Response { request_id, .. }, .. })) => {
                         texts.complete(request_id);
                         if outgoing.as_ref().is_some_and(|f| f.request == request_id) {
                             let f = outgoing.as_mut().unwrap();
@@ -452,7 +609,7 @@ async fn async_main(
                                         Ok(()) => {
                                             let frame = Frame::FileChunk { id: f.id, seq: f.offset / CHUNK_SIZE as u64, data };
                                             f.offset += len as u64;
-                                            f.request = swarm.behaviour_mut().send_request(&p, frame);
+                                            f.request = swarm.behaviour_mut().chat.send_request(&p, frame);
                                         }
                                         Err(e) => {
                                             let id = f.id; outgoing = None;
@@ -464,28 +621,56 @@ async fn async_main(
                             }
                         }
                     }
-                    SwarmEvent::Behaviour(RREvent::OutboundFailure { request_id, error, .. }) => {
+                    SwarmEvent::Behaviour(BehaviourEvent::Chat(RREvent::OutboundFailure { request_id, error, .. })) => {
                         if texts.active.is_some_and(|(id,_)| id == request_id) {
                             let queued = texts.clear().saturating_sub(1);
                             let _ = evt_tx.send(NetEvent::Error(format!("一条消息的送达结果未知，后续 {queued} 条消息尚未发送：{error}。请检查后重发。")));
-                            continue;
+                            break 'dispatch;
                         }
                         if outgoing.as_ref().is_some_and(|f| f.request == request_id) { let id = outgoing.take().unwrap().id; let _ = evt_tx.send(NetEvent::FileFailed { id, outgoing: true, reason: error.to_string() }); }
                         let _ = evt_tx.send(NetEvent::Error(format!("发送失败：{error}")));
                     }
-                    SwarmEvent::Behaviour(RREvent::InboundFailure { error, .. }) => {
+                    SwarmEvent::Behaviour(BehaviourEvent::Chat(RREvent::InboundFailure { error, .. })) => {
                         let _ = evt_tx.send(NetEvent::Error(format!("接收异常：{error}")));
                     }
-                    SwarmEvent::Behaviour(RREvent::ResponseSent { .. }) => {}
+                    SwarmEvent::Behaviour(BehaviourEvent::Chat(RREvent::ResponseSent { .. })) => {}
+                    SwarmEvent::Behaviour(BehaviourEvent::Images(event)) => match event {
+                        RREvent::Message { peer: from, message: Message::Request { request, channel, .. }, .. } => {
+                            if !ready || peer != Some(from) || image_in.is_some() {
+                                let _ = swarm.behaviour_mut().images.send_response(channel, ImageReply::Rejected("聊天尚未验证或图片接收繁忙".into()));
+                            } else {
+                                let id = file_id_seed; file_id_seed += 1;
+                                image_in = Some((id, channel, std::time::Instant::now()));
+                                let _ = evt_tx.send(NetEvent::ImageIncoming { id, bytes: request.data });
+                            }
+                        },
+                        RREvent::Message { message: Message::Response { request_id, response }, .. } => {
+                            if image_out == Some(request_id) {
+                                image_out = None;
+                                match response {
+                    ImageReply::Accepted => { let _ = evt_tx.send(NetEvent::ImageDelivered); },
+                    ImageReply::Rejected(reason) => { let _ = evt_tx.send(NetEvent::Error(format!("图片未被接收：{reason}"))); },
+                }
+                            }
+                        },
+                        RREvent::OutboundFailure { request_id, error, .. } => {
+                            if image_out == Some(request_id) {
+                                image_out = None;
+                                let _ = evt_tx.send(NetEvent::Error(format!("图片发送失败：{error}。旧客户端请改用发送文件。")));
+                            }
+                        },
+                        RREvent::InboundFailure { .. } => { image_in = None; },
+                        RREvent::ResponseSent { .. } => {},
+                    },
                     _ => {}
                 }
             }
-            Some((id, result)) = prepared_rx.recv() => {
-                if preparing != Some(id) { continue; }
+            Action::Prepared(_, id, result) => {
+                if preparing != Some(id) { break 'dispatch; }
                 preparing = None;
                 match (peer, result) {
                     (Some(p), Ok((file, size, name, sha))) => {
-                        let request = swarm.behaviour_mut().send_request(&p, Frame::FileMeta { id, name, size, sha256: sha.clone() });
+                        let request = swarm.behaviour_mut().chat.send_request(&p, Frame::FileMeta { id, name, size, sha256: sha.clone() });
                         outgoing = Some(OutgoingFile { id, file, size, sha, offset: 0, request, updated: std::time::Instant::now() });
                         let _ = evt_tx.send(NetEvent::FileSendProgress { id, done: 0, total: size });
                     }
@@ -493,7 +678,11 @@ async fn async_main(
                     _ => {}
                 }
             }
-            _ = timer.tick() => {
+            Action::Tick(_) => {
+                if image_in.as_ref().is_some_and(|(_,_,started)| started.elapsed() > Duration::from_secs(45)) {
+                    let (_, channel, _) = image_in.take().unwrap();
+                    let _ = swarm.behaviour_mut().images.send_response(channel, ImageReply::Rejected("图片处理超时".into()));
+                }
                 if outgoing.as_ref().is_some_and(|f| f.offset == f.size && f.updated.elapsed() > Duration::from_secs(120)) {
                     let id = outgoing.take().unwrap().id;
                     let _ = evt_tx.send(NetEvent::FileFailed { id, outgoing: true, reason: "未收到保存确认，请与对方核实后重新发送".into() });
@@ -501,13 +690,18 @@ async fn async_main(
                 let expired: Vec<_> = incoming.iter().filter(|(_,f)| f.updated.elapsed() > Duration::from_secs(if f.target.is_some() { 120 } else { 290 })).map(|(&id,_)| id).collect();
                 for id in expired {
                     release_incoming(id, &mut incoming, &mut swarm);
-                    if let Some(p) = peer { swarm.behaviour_mut().send_request(&p, Frame::FileReject { id, reason: "等待接收或传输超时".into() }); }
+                    if let Some(p) = peer { swarm.behaviour_mut().chat.send_request(&p, Frame::FileReject { id, reason: "等待接收或传输超时".into() }); }
                     let _ = evt_tx.send(NetEvent::FileFailed { id, outgoing: false, reason: "等待接收或传输超时，请重新发送".into() });
                 }
             }
         }
+        }
         if let Some(p) = peer {
             texts.flush(&mut swarm, &p);
+        }
+        state = PeerState { peer, pending_dial, next_seq, incoming, outgoing, texts, preparing, ready, image_in, image_out };
+        if let Some(p) = target {
+            if state.peer.is_some() || state.pending_dial.is_some() { states.insert(p, state); }
         }
     }
 }
@@ -554,7 +748,7 @@ impl OutgoingTexts {
                     Frame::Text { text, .. } => text.len(),
                     _ => unreachable!(),
                 };
-                self.active = Some((swarm.behaviour_mut().send_request(peer, frame), size));
+                self.active = Some((swarm.behaviour_mut().chat.send_request(peer, frame), size));
             }
         }
     }
@@ -643,14 +837,14 @@ fn release_incoming(
     let mut file = incoming.remove(&id)?;
     // 正常取消也结束元数据请求，避免把响应通道析构当成接收异常。
     if let Some(channel) = file.channel.take() {
-        let _ = swarm.behaviour_mut().send_response(channel, ());
+        let _ = swarm.behaviour_mut().chat.send_response(channel, ());
     }
     Some(file)
 }
 fn finish_incoming(
     id: u64,
     incoming: &mut HashMap<u64, IncomingFile>,
-    evt: &mpsc::Sender<NetEvent>,
+    evt: &EventSink,
     swarm: &mut Swarm,
     from: PeerId,
 ) {
@@ -672,7 +866,7 @@ fn finish_incoming(
                 sha256: got.clone(),
             });
             swarm
-                .behaviour_mut()
+                .behaviour_mut().chat
                 .send_request(&from, Frame::FileDone { id, sha256: got });
         }
         Err(reason) => {
@@ -682,7 +876,7 @@ fn finish_incoming(
                 reason: reason.clone(),
             });
             swarm
-                .behaviour_mut()
+                .behaviour_mut().chat
                 .send_request(&from, Frame::FileReject { id, reason });
         }
     }
@@ -691,7 +885,7 @@ fn handle_frame(
     frame: Frame,
     from: PeerId,
     incoming: &mut HashMap<u64, IncomingFile>,
-    evt: &mpsc::Sender<NetEvent>,
+    evt: &EventSink,
     swarm: &mut Swarm,
 ) {
     match frame {
@@ -730,7 +924,7 @@ fn handle_frame(
                         reason: reason.clone(),
                     });
                     swarm
-                        .behaviour_mut()
+                        .behaviour_mut().chat
                         .send_request(&from, Frame::FileReject { id, reason });
                 }
                 Ok(complete) => {
@@ -813,6 +1007,14 @@ fn mut_buf<'a>(b: &'a mut Vec<u8>) -> &'a mut [u8] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_codec_rejects_oversized_length_before_allocating_payload() {
+        let mut input = futures::io::Cursor::new(((crate::images::MAX_IMAGE_BYTES + 1) as u32).to_be_bytes());
+        assert!(futures::executor::block_on(super::image_read(&mut input, crate::images::MAX_IMAGE_BYTES)).is_err());
+        let mut empty = futures::io::Cursor::new([0u8; 4]);
+        assert!(futures::executor::block_on(super::image_read(&mut empty, crate::images::MAX_IMAGE_BYTES)).is_err());
+    }
+
     use super::*;
     #[test]
     fn malformed_hello_does_not_panic() {

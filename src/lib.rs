@@ -24,3 +24,6 @@ pub fn run() {
     desktop::run().expect("无法启动 Spark Chat");
 }
 pub mod transfer;
+
+pub mod forum;
+pub mod images;
