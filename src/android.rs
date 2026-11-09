@@ -101,6 +101,15 @@ pub fn dispatch(
     request: &Request,
 ) -> Option<Result<Value, String>> {
     match request {
+        Request::OpenLink { url } => Some((|| {
+            let url = super::validated_link(url)?;
+            let _: Value = handle
+                .state::<Documents>()
+                .0
+                .run_mobile_plugin("openLink", json!({"uri":url.as_str()}))
+                .map_err(|e| format!("无法打开链接：{e}"))?;
+            Ok(Value::Null)
+        })()),
         Request::ForumAttach => Some((|| {
             let _task = FileTask::begin(handle)?;
             let Some(path) = handle.dialog().file().blocking_pick_file() else {
@@ -143,9 +152,9 @@ pub fn dispatch(
             else {
                 return Ok(Value::Null);
             };
-            let mut target = new_document_target(handle, &path)?;
             let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
-            let bytes = super::image_bytes(&app, session_id, id)?;
+            let bytes = zeroize::Zeroizing::new(super::image_bytes(&app, session_id, id)?);
+            let mut target = new_document_target(handle, &path)?;
             target.file.write_all(&bytes).map_err(|e| e.to_string())?;
             target.commit().map_err(|e| e.to_string())?;
             Ok(json!(path.to_string()))
@@ -167,19 +176,18 @@ pub fn dispatch(
             else {
                 return Ok(Value::Null);
             };
-            let target = new_document_target(handle, &path)?;
             let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
             app.forum_material()?;
             let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
-            drop(app);
-            forum
-                .as_ref()
-                .ok_or("请先加入论坛")?
-                .export(
-                    hash.clone(),
-                    target.file.try_clone().map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
+            let bytes = zeroize::Zeroizing::new(
+                forum
+                    .as_ref()
+                    .ok_or("请先加入论坛")?
+                    .read_export(hash.clone())
+                    .map_err(|e| e.to_string())?,
+            );
+            let mut target = new_document_target(handle, &path)?;
+            target.file.write_all(&bytes).map_err(|e| e.to_string())?;
             target.commit().map_err(|e| e.to_string())?;
             Ok(json!(path.to_string()))
         })()),
@@ -277,6 +285,8 @@ pub fn dispatch(
                 return Ok(Value::Null);
             };
             let location = path.to_string();
+            let mut app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+            let size = app.check_receive_location(id, &location)?;
             let mut options = OpenOptions::new();
             options.write(true).truncate(true);
             let file = handle
@@ -300,10 +310,6 @@ pub fn dispatch(
                     );
                 }
             });
-            let size = backend
-                .lock()
-                .map_err(|_| "聊天服务暂时不可用")?
-                .check_receive_location(id, &location)?;
             let info: Result<DocumentSpace, _> = handle
                 .state::<Documents>()
                 .0
@@ -314,10 +320,7 @@ pub fn dispatch(
             {
                 return Err("保存位置空间不足或无法确认可用空间，请换一个位置".into());
             }
-            backend
-                .lock()
-                .map_err(|_| "聊天服务暂时不可用")?
-                .accept_received(id, target, location)?;
+            app.accept_received(id, target, location)?;
             Ok(json!(path.to_string()))
         })()),
         Request::OpenFile { id } => Some((|| {
