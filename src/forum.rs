@@ -8,6 +8,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod storage;
+mod wire;
 #[cfg(test)]
 mod tests;
 

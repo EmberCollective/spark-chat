@@ -66,3 +66,35 @@ pub struct SignedRecord {
     pub record: ForumRecord,
     pub signature: Vec<u8>,
 }
+
+/// Bounded request/response protocol, separate from legacy private chat.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Request {
+    pub network: Digest,
+    pub query: Query,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Query {
+    Hello { governance: Vec<SignedRecord> },
+    Inventory { after: Option<Digest> },
+    Records { ids: Vec<Digest> },
+    Body { hash: Digest },
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Response {
+    Denied,
+    Hello {
+        governance: Vec<SignedRecord>,
+    },
+    Inventory {
+        ids: Vec<Digest>,
+        more: bool,
+    },
+    Records {
+        records: Vec<SignedRecord>,
+    },
+    Body {
+        hash: Digest,
+        bytes: Option<Vec<u8>>,
+    },
+}
