@@ -174,3 +174,6 @@ mod tests {
         assert!(decode_conn_code("SPARK-中文不是连接码").is_err());
     }
 }
+
+/// Independently versioned forum objects; existing chat frames are unchanged.
+pub mod forum;
