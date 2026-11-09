@@ -2,6 +2,7 @@
 use super::*;
 mod assets;
 mod discovery;
+mod evidence;
 mod replication;
 pub use assets::AttachmentInput;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -490,26 +491,12 @@ impl Worker {
                     && public(p).is_ok_and(|p| p.to_peer_id() == *peer)
             })
     }
-    fn governance(&self) -> Vec<SignedRecord> {
-        let mut records: Vec<_> = self
-            .saved
+    fn governance(&self) -> Result<Vec<SignedRecord>> {
+        self.saved
             .as_ref()
-            .map(|s| {
-                s.forum
-                    .records
-                    .values()
-                    .filter(|r| matches!(r.record.action, Action::Governance { .. }))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        records.sort_by_key(|r| match r.record.action {
-            Action::Governance { sequence, .. } => sequence,
-            _ => 0,
-        });
-        // Local governance creation is explicitly capped at 256 records in v1.
-        // Never silently omit a later signed revocation from a received chain.
-        records
+            .map(|s| evidence::bundle(&s.forum))
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
     fn state(&self) -> Value {
         let own = self.key.public().encode_protobuf();
@@ -657,20 +644,14 @@ impl Worker {
         Ok(())
     }
     fn apply_governance(&mut self, records: Vec<SignedRecord>) -> Result<()> {
-        ensure!(records.len() <= 256, "治理记录过多");
-        let mut candidate = self
-            .saved
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("尚未加入论坛"))?
-            .forum
-            .clone();
-        for record in records {
-            ensure!(
-                matches!(record.record.action,Action::Governance{sequence,..} if sequence<=256),
-                "治理记录类型或容量无效"
-            );
-            candidate.ingest(record)?;
-        }
+        let candidate = evidence::ingest(
+            &self
+                .saved
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("尚未加入论坛"))?
+                .forum,
+            records,
+        )?;
         self.commit_forum(candidate)
     }
     fn govern(&mut self, change: GovernanceChange) -> Result<()> {
@@ -701,6 +682,7 @@ impl Worker {
             candidate.rebuild_at(now()).governance_head == Some(id),
             "治理操作依赖尚未满足"
         );
+        evidence::bundle(&candidate)?;
         s.forum = candidate;
         self.refresh();
         Ok(())
@@ -828,18 +810,14 @@ impl Worker {
                 let invite: Invitation = decode("FORUM-INVITE-", &invitation)?;
                 ensure!(
                     invite.member == self.key.public().encode_protobuf()
-                        && invite.governance.len() <= 256
+                        && invite.governance.len() <= 768
                         && invite.name.len() <= 400,
                     "邀请不属于当前身份或材料超限"
                 );
-                let mut forum = Forum::new(invite.network, invite.admin)?;
-                for r in invite.governance {
-                    ensure!(
-                        matches!(r.record.action, Action::Governance { .. }),
-                        "邀请含非治理记录"
-                    );
-                    forum.ingest(r)?;
-                }
+                let forum = evidence::ingest(
+                    &Forum::new(invite.network, invite.admin)?,
+                    invite.governance,
+                )?;
                 ensure!(
                     forum.can_access(&invite.member, now()),
                     "邀请未获批准、已过期或已撤销"
@@ -918,7 +896,7 @@ impl Worker {
                         admin: s.forum.admin.clone(),
                         member,
                         name: s.name.clone(),
-                        governance: self.governance(),
+                        governance: self.governance()?,
                     },
                 )?);
             }
@@ -1082,7 +1060,7 @@ impl Worker {
                     self.enqueue(
                         peer,
                         Query::Hello {
-                            governance: self.governance(),
+                            governance: self.governance()?,
                         },
                     );
                 }
@@ -1232,7 +1210,7 @@ impl Worker {
                 self.authenticating.remove(&peer);
                 self.peers.insert(peer);
                 Response::Hello {
-                    governance: self.governance(),
+                    governance: self.governance()?,
                 }
             }
             Query::Inventory { after } => {
@@ -1471,7 +1449,7 @@ impl Worker {
                     if now()>=self.next_expiry{self.refresh();}
                     match rx.try_recv(){Ok(command)=>{if let Some(raw)=command.raw{let result=match command.request{ForumRequest::ReadExport{hash}=>parse_hash(&hash).and_then(|h|self.read_export_bytes(h)),_=>Err(anyhow::anyhow!("无效原生请求"))};let _=raw.send(result);}else{let result=self.command(command.request,&mut swarm);let _=command.reply.send(result);}},Err(mpsc::TryRecvError::Disconnected)=>break,Err(mpsc::TryRecvError::Empty)=>{}}
                     if last_sync.elapsed()>Duration::from_secs(10){
-                        for peer in self.peers.clone(){if !self.requests.values().any(|p|p.peer==peer)&&self.queues.get(&peer).is_none_or(VecDeque::is_empty){self.enqueue(peer,Query::Hello{governance:self.governance()});}}
+                        for peer in self.peers.clone(){if !self.requests.values().any(|p|p.peer==peer)&&self.queues.get(&peer).is_none_or(VecDeque::is_empty){match self.governance(){Ok(governance)=>self.enqueue(peer,Query::Hello{governance}),Err(e)=>self.status=e.to_string()};}}
                         last_sync=Instant::now();
                     }
                     if self.dirty&&last_save.elapsed()>Duration::from_secs(1){if let Err(e)=self.persist(){self.status=format!("保存失败：{e}");}last_save=Instant::now();}
@@ -1488,7 +1466,7 @@ impl Worker {
                     SwarmEvent::ExpiredListenAddr{address,..}=>{self.listen.retain(|a|a!=&address);},
                     SwarmEvent::ConnectionEstablished{peer_id,endpoint,..}=>{
                         let local = matches!(endpoint.get_remote_address().iter().next(),Some(Protocol::Ip4(ip)) if ip.is_private() || ip.is_loopback());
-                        if !local || self.peers.len()>=8 || self.authenticating.len()>=4{let _=swarm.disconnect_peer_id(peer_id);}else{self.authenticating.insert(peer_id,Instant::now());let governance=if self.allowed(&peer_id){self.governance()}else{vec![]};self.enqueue(peer_id,Query::Hello{governance});}
+                        if !local || self.peers.len()>=8 || self.authenticating.len()>=4{let _=swarm.disconnect_peer_id(peer_id);}else{self.authenticating.insert(peer_id,Instant::now());let governance=if self.allowed(&peer_id){match self.governance(){Ok(records)=>records,Err(e)=>{self.status=e.to_string();let _=swarm.disconnect_peer_id(peer_id);continue;}}}else{vec![]};self.enqueue(peer_id,Query::Hello{governance});}
                     }
                     SwarmEvent::ConnectionClosed{peer_id,num_established:0,..}=>{self.peers.remove(&peer_id);self.authenticating.remove(&peer_id);self.queues.remove(&peer_id);self.rates.remove(&peer_id);self.requests.retain(|_,p|p.peer!=peer_id);},
                     SwarmEvent::Behaviour(Event::Message{peer,message,..})=>match message{
