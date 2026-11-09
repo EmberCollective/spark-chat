@@ -12,10 +12,12 @@ const MAGIC: &[u8] = b"SPARK-FORUM-1\0";
 const MAX_SNAPSHOT: u64 = 128 * 1024 * 1024;
 impl Forum {
     pub fn save(&self, path: &Path, key: &[u8; 32]) -> Result<()> {
-        save_bytes(path, key, &postcard::to_allocvec(self)?)
+        let plaintext = zeroize::Zeroizing::new(postcard::to_allocvec(self)?);
+        save_bytes(path, key, &plaintext)
     }
     pub fn load(path: &Path, key: &[u8; 32], network: Digest, admin: &[u8]) -> Result<Self> {
-        let decoded: Forum = postcard::from_bytes(&load_bytes(path, key)?)?;
+        let plaintext = zeroize::Zeroizing::new(load_bytes(path, key)?);
+        let decoded: Forum = postcard::from_bytes(&plaintext)?;
         ensure!(
             decoded.network == network && decoded.admin == admin,
             "论坛快照与可信配置不符"
