@@ -4,3 +4,7 @@
 
 #forum-panel #forum-category-filter{appearance:none;border:0;background:transparent;cursor:pointer;font:inherit;border-radius:0;color:#7c8980;}body.forum-mode .chat-header,body.forum-mode .section-nav{visibility:hidden;}#forum-panel dialog::backdrop{background:#20302740;}
 @media(max-width:760px){#forum-panel .mobile-nav button,#forum-panel #forum-category-filter{min-height:48px;}}
+
+/* Reuse the approved product logo instead of the prototype placeholder. */
+#forum-panel .mark { background: transparent; border-radius: 0; }
+#forum-panel .mark img { width: 32px; height: 32px; object-fit: contain; display: block; }
