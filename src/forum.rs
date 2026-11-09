@@ -7,15 +7,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-mod storage;
-mod wire;
-pub mod service;
 mod merge;
+pub mod service;
+mod storage;
 #[cfg(test)]
 mod tests;
+mod wire;
 
 const DOMAIN: &[u8] = b"SparkNet/forum/record/v1\0";
 const MAX_RECORDS: usize = 50_000;
+const MAX_RECORD_STORAGE: usize = 32 * 1024 * 1024;
+const MAX_BODY_STORAGE: usize = 64 * 1024 * 1024;
+const MAX_PENDING_RECORDS: usize = 512;
+const MAX_PENDING_STORAGE: usize = 256 * 1024;
 const MAX_PARENTS: usize = 8;
 const MAX_DEPTH: usize = 256;
 
@@ -24,6 +28,9 @@ pub fn content_id(bytes: &[u8]) -> Digest {
 }
 pub fn record_id(record: &SignedRecord) -> Result<Digest> {
     Ok(content_id(&postcard::to_allocvec(record)?))
+}
+fn record_cost(record: &SignedRecord) -> Result<usize> {
+    Ok(postcard::to_allocvec(record)?.len() + 32 + 10)
 }
 fn signing_bytes(record: &ForumRecord) -> Result<Vec<u8>> {
     let mut bytes = DOMAIN.to_vec();
@@ -178,6 +185,11 @@ pub struct Forum {
     admin: Vec<u8>,
     records: BTreeMap<Digest, SignedRecord>,
     bodies: BTreeMap<Digest, Vec<u8>>,
+    // Recomputed from verified records on load, never trusted from the snapshot.
+    #[serde(skip)]
+    record_storage: usize,
+    #[serde(skip)]
+    body_storage: usize,
 }
 
 impl Forum {
@@ -189,6 +201,8 @@ impl Forum {
             admin,
             records: BTreeMap::new(),
             bodies: BTreeMap::new(),
+            record_storage: 0,
+            body_storage: 0,
         })
     }
     pub fn network(&self) -> Digest {
@@ -208,16 +222,36 @@ impl Forum {
         let text = std::str::from_utf8(&bytes)?;
         ensure!(text.chars().count() <= 20_000, "正文超过 20000 字");
         let hash = content_id(&bytes);
+        if self.bodies.contains_key(&hash) {
+            return Ok(hash);
+        }
+        // Include map keys and length framing so small objects cannot bypass the byte budget.
+        let cost = bytes.len() + 32 + 10;
         ensure!(
-            self.bodies.contains_key(&hash)
-                || self.bodies.values().map(Vec::len).sum::<usize>() + bytes.len()
-                    <= 64 * 1024 * 1024,
+            self.bodies.len() < MAX_RECORDS && self.body_storage + cost <= MAX_BODY_STORAGE,
             "正文缓存已满"
         );
+        self.body_storage += cost;
         self.bodies.insert(hash, bytes);
         Ok(hash)
     }
     pub fn ingest(&mut self, signed: SignedRecord) -> Result<Digest> {
+        let id = record_id(&signed)?;
+        if self.records.contains_key(&id) {
+            return Ok(id);
+        }
+        self.insert_verified(signed)?;
+        // Insert before classification: a missing parent or admission must be allowed to
+        // resolve an already full pending set rather than being rejected at its entrance.
+        if let Err(error) = self.check_pending_budget() {
+            let removed = self.records.remove(&id).expect("inserted record");
+            self.record_storage -= record_cost(&removed)?;
+            return Err(error);
+        }
+        Ok(id)
+    }
+
+    fn insert_verified(&mut self, signed: SignedRecord) -> Result<Digest> {
         validate(&signed, self.network)?;
         if matches!(signed.record.action, Action::Governance { .. }) {
             ensure!(
@@ -226,13 +260,35 @@ impl Forum {
             );
         }
         let id = record_id(&signed)?;
-        ensure!(
-            self.records.contains_key(&id) || self.records.len() < MAX_RECORDS,
-            "论坛记录容量已满"
-        );
-        self.records.entry(id).or_insert(signed);
+        if !self.records.contains_key(&id) {
+            let cost = record_cost(&signed)?;
+            ensure!(
+                self.records.len() < MAX_RECORDS
+                    && self.record_storage + cost <= MAX_RECORD_STORAGE,
+                "论坛记录容量已满"
+            );
+            self.record_storage += cost;
+            self.records.insert(id, signed);
+        }
         Ok(id)
     }
+
+    fn check_pending_budget(&self) -> Result<()> {
+        let pending = self.rebuild().pending;
+        ensure!(
+            pending.len() <= MAX_PENDING_RECORDS,
+            "待验证记录过多，请先补齐依赖"
+        );
+        let bytes = pending.iter().try_fold(0usize, |sum, id| -> Result<_> {
+            Ok(sum + record_cost(&self.records[id])?)
+        })?;
+        ensure!(
+            bytes <= MAX_PENDING_STORAGE,
+            "待验证记录空间已满，请先补齐依赖"
+        );
+        Ok(())
+    }
+
     pub fn can_access(&self, author: &[u8], now: u64) -> bool {
         let view = self.rebuild();
         !view.governance_conflict

@@ -26,8 +26,10 @@ impl Forum {
 pub(super) fn validate_snapshot(decoded: Forum) -> Result<Forum> {
     let mut verified = Forum::new(decoded.network, decoded.admin)?;
     for (id, record) in decoded.records {
-        ensure!(verified.ingest(record)? == id, "记录哈希不匹配");
+        ensure!(verified.insert_verified(record)? == id, "记录哈希不匹配");
     }
+    // Hash ordering is not causal ordering: classify only after every verified record is loaded.
+    verified.check_pending_budget()?;
     for (id, body) in decoded.bodies {
         ensure!(verified.put_body(body)? == id, "正文哈希不匹配");
     }

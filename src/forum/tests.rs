@@ -186,3 +186,89 @@ fn ciphertext_roundtrip_revalidates_trust_and_detects_corruption() {
     std::fs::write(&path, data).unwrap();
     assert!(Forum::load(&path, &[7; 32], f.network(), f.admin()).is_err());
 }
+
+#[test]
+fn record_and_body_byte_limits_reject_atomically_and_duplicates_are_free() {
+    let mut f = fixture();
+    let record = post(&mut f, 2, None, vec![], "budget");
+    let cost = record_cost(&record).unwrap();
+    f.record_storage = MAX_RECORD_STORAGE - cost;
+    let id = f.ingest(record.clone()).unwrap();
+    assert_eq!(f.record_storage, MAX_RECORD_STORAGE);
+    assert_eq!(f.ingest(record).unwrap(), id);
+    let extra = post(&mut f, 2, None, vec![], "budget");
+    let before = f.records.len();
+    assert!(f.ingest(extra).is_err());
+    assert_eq!(f.records.len(), before);
+    assert_eq!(f.record_storage, MAX_RECORD_STORAGE);
+
+    let body = b"different body".to_vec();
+    f.body_storage = MAX_BODY_STORAGE - body.len() - 42;
+    let hash = f.put_body(body.clone()).unwrap();
+    assert_eq!(f.body_storage, MAX_BODY_STORAGE);
+    assert_eq!(f.put_body(body).unwrap(), hash);
+    assert!(f.put_body(b"overflow".to_vec()).is_err());
+    assert_eq!(f.body_storage, MAX_BODY_STORAGE);
+}
+
+#[test]
+fn pending_count_limit_still_accepts_the_missing_parent_and_snapshot_reload() {
+    let mut f = fixture();
+    let original = post(&mut f, 2, None, vec![], "base");
+    let root = record_id(&original).unwrap();
+    for _ in 0..MAX_PENDING_RECORDS {
+        let record = post(&mut f, 3, Some(root), vec![root], "edit");
+        f.ingest(record).unwrap();
+    }
+    assert_eq!(f.rebuild().pending.len(), MAX_PENDING_RECORDS);
+    let before = f.record_storage;
+    let extra = post(&mut f, 3, Some(root), vec![root], "excess");
+    assert!(f.ingest(extra).is_err());
+    assert_eq!(f.record_storage, before);
+    assert_eq!(f.rebuild().pending.len(), MAX_PENDING_RECORDS);
+    f.ingest(original).unwrap();
+    assert!(f.rebuild().pending.is_empty());
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot");
+    f.save(&path, &[5; 32]).unwrap();
+    let loaded = Forum::load(&path, &[5; 32], f.network, f.admin()).unwrap();
+    assert_eq!(loaded.rebuild().topics, f.rebuild().topics);
+    assert_eq!(loaded.record_storage, f.record_storage);
+    assert_eq!(loaded.body_storage, f.body_storage);
+}
+
+#[test]
+fn pending_bytes_stop_large_unknown_author_records_without_blocking_members() {
+    let mut f = fixture();
+    let mut rejected = false;
+    for _ in 0..MAX_PENDING_RECORDS {
+        let mut record = post(&mut f, 7, None, vec![], "unknown author");
+        if let Action::Content {
+            attachments, title, ..
+        } = &mut record.record.action
+        {
+            *title = "文".repeat(100);
+            *attachments = (0..5)
+                .map(|i| Attachment {
+                    name: "x".repeat(255),
+                    hash: [i; 32],
+                    size: 1,
+                })
+                .collect();
+        }
+        record.signature = key(7)
+            .sign(&signing_bytes(&record.record).unwrap())
+            .unwrap();
+        let before = f.record_storage;
+        if f.ingest(record).is_err() {
+            assert_eq!(f.record_storage, before);
+            rejected = true;
+            break;
+        }
+    }
+    assert!(rejected);
+    assert!(f.rebuild().pending.len() < MAX_PENDING_RECORDS);
+    let valid = post(&mut f, 2, None, vec![], "valid content still works");
+    let id = f.ingest(valid).unwrap();
+    assert!(!f.rebuild().pending.contains(&id));
+}
