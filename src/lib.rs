@@ -26,3 +26,4 @@ pub fn run() {
 pub mod transfer;
 
 pub mod forum;
+pub mod images;

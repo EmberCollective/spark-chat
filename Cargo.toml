@@ -20,6 +20,8 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+zeroize = "1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # 序列化与编码
 serde = { version = "1", features = ["derive"] }
