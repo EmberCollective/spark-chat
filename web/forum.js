@@ -261,7 +261,8 @@
     container.append(controls);
   }
   function bodyView(text) {
-    const paragraph = node("p", undefined, "forum-body");
+    const body = node("div", undefined, "body forum-body");
+    const paragraph = node("p"); body.append(paragraph);
     for (const part of text.split(/(https?:\/\/[^\s<>]+)/g)) {
       if (!/^https?:\/\//.test(part)) { paragraph.append(document.createTextNode(part)); continue; }
       const link = node("a", part); link.href = part;
@@ -271,99 +272,87 @@
       });
       paragraph.append(link);
     }
-    return paragraph;
+    return body;
+  }
+  function attachmentView(attachment, communityId) {
+    const row=node("div",undefined,"attachment");
+    const info=node("div");info.append(document.createTextNode(attachment.name),node("small",`${(attachment.size/1e6).toFixed(2)} MB`));
+    const action=button(attachment.ready?"下载":"查找副本",async()=>{
+      if(!attachment.ready){await run({kind:"fetch",hash:attachment.hash});return;}
+      try{const saved=await window.__TAURI__.core.invoke("dispatch",{request:{action:"forum_save",community_id:communityId,hash:attachment.hash,name:attachment.name,size:attachment.size}});if(saved)note("文件已保存到选择的位置。");}catch(error){note(error);}
+    });action.className="";row.append(node("span","▧"),info,action);return row;
   }
   function contentView(topic) {
-    const communityId = snapshot?.current_community;
-    const locked = topic.locked || Boolean(topic.reply_to && snapshot.topics.find(t => t.id === topic.reply_to)?.locked);
-    const article = node("article", undefined, "post forum-post");
-    const avatar=node("span",Array.from(displayName(topic.author))[0],"avatar");
-    const content=node("div",undefined,"post-content"); article.append(avatar,content);
-    const head=node("div",undefined,"post-head"); head.append(node("strong",displayName(topic.author)),node("span","签名已验证","badge")); content.append(head);
-
-
-    if (topic.heads.length > 1) {
-      content.append(node("p", topic.merged_body != null ? "不重叠的修改已自动组合；原始署名版本仍保留。" : "有并发修改，以下版本均已保留。可编辑并提交一个合并版本。", "forum-conflict"));
-      if (topic.merged_body != null) content.append(bodyView(topic.merged_body));
-    }
-    const menu=node("details"); menu.className="post-menu";menu.append(node("summary","•••"));head.append(menu);
-    const history = node("details");
-    history.append(node("summary", "查看署名修改历史"));
-    for (const version of topic.versions || []) {
-      const section = node("section", undefined, "forum-version");
-      section.append(node("p", `署名 ${displayName(version.author)} · ${version.id.slice(0, 12)}`, "meta"));
-      if (version.body_copies != null) section.append(node("p", version.body_copies > 1 ? `正文 ${version.body_copies} 份当前在线副本（含本机）` : version.body != null ? "正文仅本机保存，等待其他节点确认" : "正文尚未缓存", "subtle"));
-      if (version.body != null) section.append(bodyView(version.body));
-      else section.append(button("查找并获取正文", () => run({ kind: "fetch", hash: version.body_hash })));
-      for (const attachment of version.attachments || []) {
-        section.append(button(`${attachment.name} · ${(attachment.size / 1e6).toFixed(2)} MB · ${attachment.ready ? "保存文件" : "查找副本"}${attachment.copies != null ? ` · ${attachment.copies} 份在线副本` : ""}`, async () => {
-          if (!attachment.ready) { await run({ kind: "fetch", hash: attachment.hash }); return; }
-          try {
-            const saved = await window.__TAURI__.core.invoke("dispatch",{request:{action:"forum_save",community_id:communityId,hash:attachment.hash,name:attachment.name,size:attachment.size}});
-            if (saved) note("文件已保存到选择的位置。");
-          } catch(error) { note(error); }
-        }));
-        if (attachment.ready && attachment.size <= 5_000_000 && /\.(png|jpe?g|webp)$/i.test(attachment.name)) {
-          const image = node("img"); image.alt = attachment.name; image.className = "chat-photo";
-          const generation=epoch;
-          window.__TAURI__.core.invoke("dispatch",{request:{action:"forum_preview",community_id:communityId,hash:attachment.hash}}).then(result=>{
-            if(generation===epoch && ["image/png","image/jpeg","image/webp"].includes(result.mime)) image.src=`data:${result.mime};base64,${result.data}`;
-          }).catch(()=>{image.alt="图片无法预览，可作为文件保存";});
-          section.append(image);
+    const communityId=snapshot?.current_community;
+    const locked=topic.locked||Boolean(topic.reply_to&&snapshot.topics.find(t=>t.id===topic.reply_to)?.locked);
+    const article=node("article",undefined,"post forum-post"),content=node("div",undefined,"post-content");
+    article.append(node("span",Array.from(displayName(topic.author))[0],"avatar"),content);
+    const head=node("div",undefined,"post-head");head.append(node("strong",displayName(topic.author)));
+    if(!topic.reply_to)head.append(node("span","楼主","badge"));
+    const more=button("•••",()=>{
+      const opening=menu.hidden;
+      for(const other of panel.querySelectorAll(".post-menu"))other.hidden=true;
+      menu.hidden=!opening;
+      if(opening){const rect=more.getBoundingClientRect();menu.style.left=`${Math.max(8,Math.min(rect.right-220,window.innerWidth-228))}px`;menu.style.top=`${Math.max(8,Math.min(rect.bottom+6,window.innerHeight-menu.offsetHeight-8))}px`;}
+    });more.className="";more.setAttribute("aria-label","帖子更多操作");head.append(more);content.append(head);
+    const menu=node("div",undefined,"post-menu");menu.hidden=true;menu.setAttribute("role","menu");content.append(menu);
+    const dialog=node("dialog",undefined,"post-info-dialog");const dialogTitle=node("h2"),dialogBody=node("div");const close=button("关闭",()=>dialog.close());const closeBar=node("div",undefined,"bottom-actions");closeBar.append(close);dialog.append(dialogTitle,dialogBody,closeBar);content.append(dialog);
+    function action(label,callback){const item=button(label,()=>{menu.hidden=true;callback();});item.className="";item.setAttribute("role","menuitem");menu.append(item);return item;}
+    function info(label,build){action(label,()=>{dialogTitle.textContent=label;dialogBody.replaceChildren();build(dialogBody);dialog.showModal();});}
+    if(topic.heads.length>1)content.append(node("p",topic.merged_body!=null?"并发修改已自动组合，原始版本已保留。":"存在并发修改，请查看各版本或提交合并。","forum-conflict"));
+    const current=(topic.versions||[]).filter(version=>topic.heads.includes(version.id));
+    if(topic.merged_body!=null)content.append(bodyView(topic.merged_body));
+    for(const version of current){
+      if(topic.merged_body==null){if(version.body!=null)content.append(bodyView(version.body));else content.append(button("查找并获取正文",()=>run({kind:"fetch",hash:version.body_hash})));}
+      for(const attachment of version.attachments||[]){
+        content.append(attachmentView(attachment,communityId));
+        if(attachment.ready&&attachment.size<=5_000_000&&/\.(png|jpe?g|webp)$/i.test(attachment.name)){
+          const image=node("img");image.alt=attachment.name;image.className="chat-photo";const generation=epoch;
+          window.__TAURI__.core.invoke("dispatch",{request:{action:"forum_preview",community_id:communityId,hash:attachment.hash}}).then(result=>{if(generation===epoch&&["image/png","image/jpeg","image/webp"].includes(result.mime))image.src=`data:${result.mime};base64,${result.data}`;}).catch(()=>{image.alt="图片无法预览，可作为文件保存";});content.append(image);
         }
       }
-      if (topic.heads.includes(version.id)) content.append(section);
-      else history.append(section);
     }
-    if (history.children.length > 1) menu.append(history);
-    const versions = topic.versions || [];
-    if (versions.length > 1) {
-      const comparison = node("details"); comparison.append(node("summary", "对照两个版本"));
-      const columns = node("div", undefined, "forum-compare");
-      [0, versions.length - 1].forEach(initial => {
-        const column = node("section"); const picker = node("select");
-        picker.setAttribute("aria-label", "选择对照版本");
-        versions.forEach((version, index) => { const option = node("option", `${version.author.slice(-8)} · ${version.id.slice(0,8)}`); option.value = index; picker.append(option); });
-        const body = node("div"); picker.value = initial;
-        const show = () => { const version = versions[Number(picker.value)]; body.replaceChildren(version.body == null ? button("获取此版本正文", () => run({kind:"fetch",hash:version.body_hash})) : bodyView(version.body)); };
-        picker.addEventListener("change", show); show(); column.append(picker, body); columns.append(column);
-      });
-      comparison.append(columns); menu.append(comparison);
-    }
-    if (locked) content.append(node("p", "管理员已锁定此主题；未确认的并发变更保留为争议。", "forum-conflict"));
-    else menu.append(button(topic.heads.length > 1 ? "编辑并确认合并" : "署名编辑", () => openEditor(topic)));
-    menu.append(button("举报", () => { const reason = prompt("举报原因（将作为署名记录保存，管理员可处理）"); if(reason?.trim()) run({kind:"report",target:topic.id,reason:reason.trim()}); }));
-    return article;
+    info("查看修改历史",body=>{
+      for(const version of topic.versions||[]){const section=node("section");section.append(node("p",`署名 ${displayName(version.author)} · ${version.id}`,"meta"));section.append(version.body!=null?bodyView(version.body):button("获取此版本正文",()=>run({kind:"fetch",hash:version.body_hash})));for(const attachment of version.attachments||[])section.append(attachmentView(attachment,communityId));body.append(section);}
+    });
+    if(topic.versions.length>1)info("对照两个版本",body=>{
+      const columns=node("div",undefined,"forum-compare");
+      for(const initial of [0,topic.versions.length-1]){const column=node("section"),picker=node("select"),text=node("div");picker.setAttribute("aria-label","选择对照版本");topic.versions.forEach((version,index)=>{const option=node("option",`${displayName(version.author)} · ${version.id.slice(0,8)}`);option.value=index;picker.append(option);});picker.value=initial;const show=()=>{const version=topic.versions[Number(picker.value)];text.replaceChildren(version.body!=null?bodyView(version.body):button("获取此版本正文",()=>run({kind:"fetch",hash:version.body_hash})));};picker.addEventListener("change",show);show();column.append(picker,text);columns.append(column);}body.append(columns);
+    });
+    info("查看签名与保存状态",body=>{
+      body.append(node("p",`创建者：${displayName(topic.author)}`),node("code",topic.author));
+      for(const version of current){body.append(node("p",`修改者：${displayName(version.author)}`),node("code",version.author),node("p",`版本：${version.id}`));body.append(node("p",version.body_copies>1?`正文 ${version.body_copies} 份当前在线副本（含本机）`:version.body!=null?"正文仅本机保存，等待其他节点确认":"正文尚未缓存"));for(const attachment of version.attachments||[])body.append(node("p",`${attachment.name}：${attachment.copies||0} 份在线副本`));}
+    });
+    if(!locked){action(topic.heads.length>1?"编辑并确认合并":"署名编辑",()=>openEditor(topic));action("引用回复",()=>{openEditor(null,topic.reply_to||topic.id);$f("forum-body").value=(topic.merged_body??current[0]?.body??"").split("\n").map(line=>"> "+line).join("\n")+"\n\n";scheduleDraft();});}
+    info("举报",body=>{
+      body.append(node("p","说明举报原因，记录将由你署名并交给当前社区管理员。","sub"));
+      const reason=node("textarea");reason.className="input";reason.maxLength=500;reason.rows=5;reason.setAttribute("aria-label","举报原因");body.append(reason);
+      const failure=node("p",undefined,"sub");failure.setAttribute("role","alert");body.append(failure);
+      const actions=node("div",undefined,"bottom-actions"),submit=button("提交举报",async()=>{
+        const text=reason.value.trim();if(!text){reason.focus();return;}
+        submit.disabled=true;try{if(await run({kind:"report",target:topic.id,reason:text}))dialog.close();else failure.textContent=status.textContent||"举报未提交，请重试。";}finally{submit.disabled=false;}
+      });submit.className="primary";actions.append(submit);body.append(actions);
+    });
+    if(snapshot.admin&&!topic.reply_to)info("管理此主题",body=>{
+      body.append(button("隐藏主题",()=>{dialog.close();run({kind:"moderate",target:topic.id,hidden:true});}),button(topic.locked?"解除主题锁定":"锁定主题",()=>{dialog.close();run({kind:"lock",target:topic.id,locked:!topic.locked});}));
+      const category=node("select");category.setAttribute("aria-label","设置主题版块");for(const [id,title]of Object.entries(snapshot.categories||{})){const option=node("option",title);option.value=id;category.append(option);}category.value=topic.category||"";category.addEventListener("change",()=>{dialog.close();run({kind:"categorize",target:topic.id,category:category.value});});body.append(category);
+    });
+    if(locked&&!topic.reply_to)content.append(node("p","管理员已锁定此主题。","forum-conflict"));
+    const actions=node("div",undefined,"post-actions");
+    if(!locked){const reply=button("↩ 回复",()=>openEditor(null,topic.reply_to||topic.id));reply.className="";actions.append(reply);}
+    const saved=button("查看保存状态",()=>{menu.querySelectorAll("button").forEach(item=>{if(item.textContent==="查看签名与保存状态")item.click();});});saved.className="";actions.append(saved);content.append(actions);return article;
   }
+  document.addEventListener("click",event=>{if(!event.target.closest(".post-menu")&&!event.target.closest('[aria-label="帖子更多操作"]'))for(const menu of panel.querySelectorAll(".post-menu"))menu.hidden=true;});
   function renderDetail() {
-    detail.replaceChildren();
-    const topic = snapshot?.topics?.find(t => t.id === selected);
-    if (!topic) return;
-    const crumb=node("div",undefined,"crumb"); crumb.append(button("返回主题列表",goHome),document.createTextNode(` / ${snapshot.categories?.[topic.category]||"综合"}`)); detail.append(crumb,node("h1",topic.title||"未命名主题"));
-    detail.append(node("div",`${snapshot.reply_total||0} 条回复 · ${snapshot.categories?.[topic.category]||"综合"}`,"meta"));
-    list.hidden = true;
-    if (topic.hidden) { detail.append(node("p", "该主题已由管理员隐藏。")); if(snapshot.admin) detail.append(button("恢复显示",()=>run({kind:"moderate",target:selected,hidden:false}))); return; }
+    detail.replaceChildren();const topic=snapshot?.topics?.find(t=>t.id===selected);if(!topic)return;
+    const crumb=node("div",undefined,"crumb"),home=button("所有主题",goHome);home.className="";crumb.append(home,document.createTextNode(` / ${snapshot.categories?.[topic.category]||"综合"}`));detail.append(crumb,node("h1",topic.title||"未命名主题"));
+    const meta=node("div",undefined,"meta");meta.append(node("span",snapshot.categories?.[topic.category]||"综合","badge"),node("span",`${snapshot.reply_total||0} 条回复`),node("span",topic.locked?"已锁定":"讨论中"));detail.append(meta);list.hidden=true;
+    if(topic.hidden){detail.append(node("p","该主题已由管理员隐藏。"));if(snapshot.admin)detail.append(button("恢复显示",()=>run({kind:"moderate",target:selected,hidden:false})));return;}
     detail.append(contentView(topic));
-    for (const version of topic.versions || []) {
-      if (topic.heads.includes(version.id) && version.body == null && !requested.has(version.body_hash)) {
-        requested.add(version.body_hash);
-        command({ kind: "fetch", hash: version.body_hash }).catch(note);
-      }
-    }
-    for (const reply of snapshot.topics.filter(t => t.reply_to === selected && !t.hidden)) detail.append(contentView(reply));
-    paginate(detail, snapshot.reply_offset || 0, snapshot.reply_total || 0, offset => run({ kind: "topic", id: selected, offset }));
-    if (!topic.locked) {
-      detail.append(button("回复", () => openEditor(null, selected)));
-      detail.append(button("引用回复", () => { openEditor(null, selected); const current=topic.versions.find(v=>topic.heads.includes(v.id)); $f("forum-body").value=(current?.body || "").split("\n").map(line=>"> "+line).join("\n")+"\n\n"; scheduleDraft(); }));
-    }
-    if (snapshot.admin) {
-      const moderation=node("details");moderation.append(node("summary","管理此主题"));detail.append(moderation);
-      moderation.append(button("隐藏主题", () => run({ kind: "moderate", target: selected, hidden: true })));
-      moderation.append(button(topic.locked ? "解除主题锁定" : "锁定主题", () => run({kind:"lock",target:selected,locked:!topic.locked})));
-      const category = node("select"); category.setAttribute("aria-label", "设置主题版块");
-      for(const [id,title] of Object.entries(snapshot.categories || {})) {const option=node("option",title);option.value=id;category.append(option);}
-      category.value=topic.category || ""; category.addEventListener("change",()=>run({kind:"categorize",target:selected,category:category.value}));moderation.append(category);
-    }
+    for(const version of topic.versions||[])if(topic.heads.includes(version.id)&&version.body==null&&!requested.has(version.body_hash)){requested.add(version.body_hash);command({kind:"fetch",hash:version.body_hash}).catch(note);}
+    for(const reply of snapshot.topics.filter(t=>t.reply_to===selected&&!t.hidden))detail.append(contentView(reply));
+    paginate(detail,snapshot.reply_offset||0,snapshot.reply_total||0,offset=>run({kind:"topic",id:selected,offset}));
+    const bar=node("div",undefined,"reply-bar");bar.append(button("返回主题列表",goHome));if(!topic.locked){const reply=button("回复主题",()=>openEditor(null,selected));reply.className="primary";bar.append(reply);}detail.append(bar);
   }
   function openEditor(topic = null, replyTo = null) {
     const current = topic?.versions?.find(version => topic.heads.includes(version.id));
@@ -514,7 +503,7 @@
   });
   let refreshing = false;
   setInterval(async () => {
-    if (panel.hidden || busy || refreshing || document.hidden) return;
+    if (panel.hidden || busy || refreshing || document.hidden || panel.querySelector("dialog[open]")) return;
     refreshing = true;
     try { await refresh(); } finally { refreshing = false; }
   }, 3000);

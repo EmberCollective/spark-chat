@@ -10,6 +10,7 @@
   let delayImage = false;
   let nextImage = 0;
   let failInitial = false;
+  let failReport = true;
   const files = { "peer-alice": [], "peer-bob": [] };
   const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJ1sAAAAASUVORK5CYII=";
   const initial = () => ({ vault_created:true, my_id:"self", peer_id:active, active_session:active,
@@ -43,6 +44,7 @@
       case "forum_attach": return {attachment:{hash:"test-attachment",name:"测试附件.txt",size:12}};
       case "forum": {
         const command=request.command;
+        if(command.kind==="report"&&failReport)throw new Error("测试举报失败");
         if(command.kind==="community_select"){forum.current_community=command.id;forum.admin=command.id==="campus";forum.name=forum.admin?"测试论坛":"技术社";}
         if(command.kind==="nickname"){forum.nickname=command.nickname;forum.nicknames[forum.own_public]=command.nickname;}
         if(command.kind==="lock") topics.find(t=>t.id===command.target).locked=command.locked;
@@ -130,13 +132,23 @@
       document.querySelector(".forum-topic").click();await tick();
       check($("forum-detail").textContent.includes("修改甲")&&$("forum-detail").textContent.includes("修改乙"),"并发版本完整展示");
       check(!$("forum-detail").textContent.includes("私聊"),"论坛不提供私聊入口");
+      check(!$("forum-detail").querySelector(".post-content > .meta")&&$("forum-detail").querySelector(".reply-bar .primary").textContent==="回复主题","详情默认保留正文与回复栏而不堆叠签名技术信息");
+      check(!$("forum-detail").querySelector(".crumb button").classList.contains("secondary"),"详情面包屑沿用原型文字按钮");
+      const openPostAction=label=>{document.querySelector('[aria-label="帖子更多操作"]').click();[...$("forum-detail").querySelectorAll('.post-menu button')].find(b=>b.textContent===label).click();};
+      openPostAction("查看签名与保存状态");
+      check($("forum-detail").querySelector("dialog[open]").textContent.includes("版本："),"签名版本证据可从更多菜单按需查看");pageButton($("forum-detail").querySelector("dialog[open]"),"关闭").click();
+      openPostAction("查看修改历史");check($("forum-detail").querySelector("dialog[open]").textContent.includes("原文"),"历史原始版本在同风格对话框保留");pageButton($("forum-detail").querySelector("dialog[open]"),"关闭").click();
+      openPostAction("举报");const reportDialog=$("forum-detail").querySelector("dialog[open]");reportDialog.querySelector("textarea").value="测试举报";pageButton(reportDialog,"提交举报").click();await tick();
+      check(reportDialog.open&&reportDialog.querySelector("textarea").value==="测试举报"&&reportDialog.textContent.includes("测试举报失败"),"举报失败保留原因输入并显示错误");failReport=false;pageButton(reportDialog,"提交举报").click();await tick();
+      check(calls.some(c=>c.action==="forum"&&c.command.kind==="report"&&c.command.reason==="测试举报"),"举报使用社区署名接口及同风格表单");
+      openPostAction("管理此主题");
       const categorySelect=$("forum-detail").querySelector('select[aria-label="设置主题版块"]');
       categorySelect.value="study";categorySelect.dispatchEvent(new Event("change"));await tick();
       check(calls.some(c=>c.action==="forum"&&c.command.kind==="categorize"&&c.command.target==="root"&&c.command.category==="study"),"管理员分类操作携带主题与目标版块");
-      pageButton($("forum-detail"),"锁定主题").click();await tick();
+      openPostAction("管理此主题");pageButton($("forum-detail"),"锁定主题").click();await tick();
       check(calls.some(c=>c.action==="forum"&&c.command.kind==="lock"&&c.command.locked===true)&&$("forum-detail").textContent.includes("管理员已锁定"),"管理员可锁定主题并展示锁定状态");
       check(![...$("forum-detail").querySelectorAll("button")].some(b=>b.textContent.includes("署名编辑")||b.textContent==="回复"),"锁定主题隐藏署名编辑和回复入口");
-      pageButton($("forum-detail"),"解除主题锁定").click();await tick();
+      openPostAction("管理此主题");pageButton($("forum-detail"),"解除主题锁定").click();await tick();
 
       check($("forum-detail").textContent.includes("分页回复 1")&&!$("forum-detail").textContent.includes("分页回复 3"),"主题详情按页展示回复");
       pageButton($("forum-detail"),"下一页").click();await tick();
