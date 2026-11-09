@@ -19,10 +19,29 @@ use std::{
 };
 use zeroize::Zeroize;
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DraftData {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ForumRequest {
     State,
+    Draft {
+        #[serde(flatten)]
+        draft: DraftData,
+    },
     #[serde(skip)]
     Attach {
         name: String,
@@ -173,6 +192,7 @@ struct Saved {
     name: String,
     forum: Forum,
     cached: BTreeMap<Digest, assets::Cached>,
+    draft: DraftData,
 }
 #[derive(Serialize, Deserialize)]
 struct Invitation {
@@ -218,6 +238,8 @@ impl Drop for Worker {
         self.storage_key.zeroize();
         if let Some(saved) = &mut self.saved {
             saved.name.zeroize();
+            saved.draft.title.zeroize();
+            saved.draft.body.zeroize();
             for body in saved.forum.bodies.values_mut() {
                 body.zeroize();
             }
@@ -291,6 +313,7 @@ impl Worker {
                 name: value.name,
                 forum: super::storage::validate_snapshot(value.forum)?,
                 cached: value.cached,
+                draft: value.draft,
             })
         } else {
             None
@@ -406,7 +429,7 @@ impl Worker {
                 topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":self.view.topics.len(),"truncated":self.view.topics.len()>100,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now()})).collect::<Vec<_>>(),"status":self.status})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":self.view.topics.len(),"truncated":self.view.topics.len()>100,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now()})).collect::<Vec<_>>(),"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
     }
     fn apply_governance(&mut self, records: Vec<SignedRecord>) -> Result<()> {
         ensure!(records.len() <= 256, "治理记录过多");
@@ -479,6 +502,35 @@ impl Worker {
         let mut attachment = None;
         match request {
             ForumRequest::State => {}
+            ForumRequest::Draft { draft } => {
+                ensure!(
+                    draft.title.chars().count() <= 100
+                        && draft.body.chars().count() <= 20_000
+                        && draft.parents.len() <= 8
+                        && draft.attachments.len() <= 5,
+                    "草稿超过限制"
+                );
+                for hash in draft
+                    .target
+                    .iter()
+                    .chain(draft.reply_to.iter())
+                    .chain(draft.parents.iter())
+                {
+                    parse_hash(hash)?;
+                }
+                for a in &draft.attachments {
+                    parse_hash(&a.hash)?;
+                    ensure!(
+                        a.size <= MAX_ATTACHMENT_BYTES && a.name.len() <= 255,
+                        "草稿附件无效"
+                    );
+                }
+                self.saved
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("尚未加入论坛"))?
+                    .draft = draft;
+                self.dirty = true;
+            }
             ForumRequest::Attach { name, file } => {
                 attachment = Some(self.attach_file(name, file)?);
             }
@@ -500,6 +552,7 @@ impl Worker {
                     name,
                     forum: Forum::new(network, self.key.public().encode_protobuf())?,
                     cached: BTreeMap::new(),
+                    draft: DraftData::default(),
                 });
                 self.refresh();
             }
@@ -528,6 +581,7 @@ impl Worker {
                     name: invite.name,
                     forum,
                     cached: BTreeMap::new(),
+                    draft: DraftData::default(),
                 });
                 self.refresh();
             }
@@ -664,6 +718,7 @@ impl Worker {
                     "发布依赖缺失或有撤销争议"
                 );
                 s.forum = candidate;
+                s.draft = DraftData::default();
                 self.refresh();
                 self.status = "已在本机保存，正在同步".into();
             }
@@ -1073,10 +1128,18 @@ mod tests {
         b.export(hash, std::fs::File::create(&target).unwrap())
             .unwrap();
         assert_eq!(std::fs::read(target).unwrap(), payload);
-        b.handle(ForumRequest::State).unwrap();
+        b.handle(ForumRequest::Draft {
+            draft: DraftData {
+                title: "未发草稿".into(),
+                body: "重启保留".into(),
+                ..Default::default()
+            },
+        })
+        .unwrap();
         drop(b);
         std::thread::sleep(Duration::from_millis(150));
         let b = ForumService::start([2; 32], [9; 32], b_dir.path().into()).unwrap();
+        assert_eq!(state(&b)["draft"]["body"], "重启保留");
         assert!(state(&b)["topics"]
             .as_array()
             .unwrap()
@@ -1111,6 +1174,7 @@ mod tests {
             name: "test".into(),
             forum,
             cached: BTreeMap::new(),
+            draft: DraftData::default(),
         });
         w.refresh();
         let peer = w.key.public().to_peer_id();
@@ -1149,6 +1213,7 @@ mod tests {
             name: "test".into(),
             forum: Forum::new([7; 32], w.key.public().encode_protobuf()).unwrap(),
             cached: BTreeMap::new(),
+            draft: DraftData::default(),
         });
         w.refresh();
         let stranger = Keypair::ed25519_from_bytes([2; 32])
