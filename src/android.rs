@@ -1,5 +1,5 @@
 //! 安卓系统文档授权只在原生层使用，不把文件内容或密钥送入页面。
-use super::{Backend, Request};
+use super::{Backend, ForumBackend, Request};
 use crate::vault::{Vault, VaultError};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -67,12 +67,122 @@ fn write_document(handle: &tauri::AppHandle, path: FilePath, data: &[u8]) -> std
     file.flush()
 }
 
+fn new_document_target(
+    handle: &tauri::AppHandle,
+    path: &FilePath,
+) -> Result<crate::transfer::ReceiveTarget, String> {
+    let mut options = OpenOptions::new();
+    options.write(true).truncate(true);
+    let file = handle
+        .fs()
+        .open(path.clone(), options)
+        .map_err(|e| e.to_string())?;
+    let app_handle = handle.clone();
+    let uri = path.to_string();
+    Ok(crate::transfer::ReceiveTarget::document(file, move || {
+        let result: Result<Value, _> = app_handle
+            .state::<Documents>()
+            .0
+            .run_mobile_plugin("remove", json!({"uri":uri}));
+        if result.is_err() {
+            let _ = tauri::Emitter::emit(
+                &app_handle,
+                "spark-event",
+                crate::ui::UiEvent::Error("未完成的文件未能清理，请在所选目录检查".into()),
+            );
+        }
+    }))
+}
+
 pub fn dispatch(
     handle: &tauri::AppHandle,
     backend: &Backend,
+    forum_backend: &ForumBackend,
     request: &Request,
 ) -> Option<Result<Value, String>> {
     match request {
+        Request::ForumAttach => Some((|| {
+            let _task = FileTask::begin(handle)?;
+            let Some(path) = handle.dialog().file().blocking_pick_file() else {
+                return Ok(Value::Null);
+            };
+            let info: DocumentName = handle
+                .state::<Documents>()
+                .0
+                .run_mobile_plugin("metadata", json!({"uri":path.to_string()}))
+                .map_err(|e| e.to_string())?;
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let file = handle.fs().open(path, options).map_err(|e| e.to_string())?;
+            let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+            app.forum_material()?;
+            let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+            drop(app);
+            forum
+                .as_ref()
+                .ok_or("请先加入论坛")?
+                .attach(info.name, file)
+                .map_err(|e| e.to_string())
+        })()),
+        Request::SaveImage { session_id, id } => Some((|| {
+            let _task = FileTask::begin(handle)?;
+            let extension = {
+                let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+                let bytes = super::image_bytes(&app, session_id, id)?;
+                if image::guess_format(&bytes).ok() == Some(image::ImageFormat::Png) {
+                    "png"
+                } else {
+                    "jpg"
+                }
+            };
+            let Some(path) = handle
+                .dialog()
+                .file()
+                .set_file_name(format!("聊天图片.{extension}"))
+                .blocking_save_file()
+            else {
+                return Ok(Value::Null);
+            };
+            let mut target = new_document_target(handle, &path)?;
+            let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+            let bytes = super::image_bytes(&app, session_id, id)?;
+            target.file.write_all(&bytes).map_err(|e| e.to_string())?;
+            target.commit().map_err(|e| e.to_string())?;
+            Ok(json!(path.to_string()))
+        })()),
+        Request::ForumSave { hash, name, size } => Some((|| {
+            let _task = FileTask::begin(handle)?;
+            if *size > 20_000_000 {
+                return Err("附件超过大小限制".into());
+            }
+            let name = std::path::Path::new(name)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("附件");
+            let Some(path) = handle
+                .dialog()
+                .file()
+                .set_file_name(name)
+                .blocking_save_file()
+            else {
+                return Ok(Value::Null);
+            };
+            let target = new_document_target(handle, &path)?;
+            let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+            app.forum_material()?;
+            let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+            drop(app);
+            forum
+                .as_ref()
+                .ok_or("请先加入论坛")?
+                .export(
+                    hash.clone(),
+                    target.file.try_clone().map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            target.commit().map_err(|e| e.to_string())?;
+            Ok(json!(path.to_string()))
+        })()),
         Request::PickKeyfile { create } => Some(Ok({
             let dialog = handle.dialog().file().set_file_name("spark.keyfile");
             let path = if *create {
@@ -115,7 +225,13 @@ pub fn dispatch(
             })
             .map(|v| json!(v))
         })()),
-        Request::SendFile => Some((|| {
+        Request::SendFile { session_id } => Some((|| {
+            let target = session_id.clone().unwrap_or_else(|| {
+                backend
+                    .lock()
+                    .map(|app| app.initial_state().peer_id)
+                    .unwrap_or_default()
+            });
             let _task = FileTask::begin(handle)?;
             let Some(path) = handle.dialog().file().blocking_pick_file() else {
                 return Ok(Value::Null);
@@ -137,7 +253,7 @@ pub fn dispatch(
             backend
                 .lock()
                 .map_err(|_| "聊天服务暂时不可用")?
-                .send_opened(name, file)?;
+                .send_opened_to(&target, name, file)?;
             Ok(Value::Null)
         })()),
         Request::SaveFile { id } => Some((|| {

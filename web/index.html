@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Spark Chat</title>
     <link rel="stylesheet" href="app.css" />
+    <link rel="stylesheet" href="forum.css" />
     <script src="app.js" defer></script>
+    <script src="forum.js" defer></script>
   </head>
   <body>
     <svg
@@ -134,6 +136,7 @@
           </details>
         </div>
       </header>
+      <nav class="section-nav" aria-label="论坛与聊天"><button id="forum-open" class="quiet" type="button">校园论坛</button><label class="sr-only" for="session-picker">切换聊天</label><select id="session-picker" aria-label="切换聊天" hidden></select></nav>
       <div id="banner" class="banner" role="alert" hidden>
         <span id="banner-text"></span
         ><button id="reconnect" type="button" hidden>重新连接</button
@@ -207,7 +210,32 @@
           </div>
         </div>
       </section>
+      <section id="forum-panel" class="forum-panel" hidden aria-label="校园论坛">
+        <div class="forum-toolbar"><button id="forum-close" class="text-button" type="button">返回聊天</button><h2 id="forum-name">校园论坛</h2><button id="forum-refresh" class="secondary" type="button">同步</button></div>
+        <p id="forum-network" class="subtle"></p><p id="forum-status" role="status"></p>
+        <div id="forum-setup">
+          <label for="forum-own-public">我的加入申请身份（公开信息，可交给管理员）</label><textarea id="forum-own-public" readonly rows="2"></textarea>
+          <h3>建立自己的论坛</h3><label for="forum-create-name">论坛名称</label><input id="forum-create-name" maxlength="100" placeholder="例如：校园交流"><button id="forum-create" class="primary" type="button">创建并成为管理员</button>
+          <h3>加入已有论坛</h3><label for="forum-join-code">管理员提供的入网材料</label><textarea id="forum-join-code" rows="3" placeholder="粘贴完整入网材料"></textarea><button id="forum-join" class="secondary" type="button">验证并加入</button>
+        </div>
+        <div id="forum-main" hidden>
+          <details><summary>连接网络</summary><p class="subtle">地址变化后需要新的入口。连接码不代替成员资格。</p><button id="forum-listen" class="secondary" type="button">生成当前入口</button><label for="forum-peer-code">在线成员的入口</label><textarea id="forum-peer-code" rows="2"></textarea><button id="forum-connect" class="secondary" type="button">连接节点</button></details>
+          <div id="forum-code-box" hidden><label for="forum-code">可复制的完整材料</label><textarea id="forum-code" readonly rows="3"></textarea></div>
+          <div class="forum-toolbar"><label class="sr-only" for="forum-search">搜索已同步标题</label><input id="forum-search" type="search" placeholder="搜索已同步标题"><button id="forum-new" class="primary" type="button">发布主题</button></div>
+          <button id="forum-resume-draft" class="text-button" type="button" hidden>继续未发布草稿</button>
+          <div id="forum-topics"></div><div id="forum-detail"></div>
+          <form id="forum-editor" hidden>
+            <label for="forum-title">标题</label><input id="forum-title" maxlength="100" required>
+            <label for="forum-body">正文</label><textarea id="forum-body" rows="8" maxlength="20000" required placeholder="写下你的内容，每次修改都会署名保留"></textarea>
+            <button id="forum-attach" class="secondary" type="button">添加图片或文件</button><div id="forum-attachments"></div>
+            <p class="subtle">内容更新保留版本历史。请勿发布你不希望其他成员保存的资料。</p>
+            <button id="forum-submit" class="primary" type="submit">签署并发布</button><button id="forum-cancel" class="text-button" type="button">暂不发布</button>
+          </form>
+          <details id="forum-admin" hidden><summary>成员管理</summary><label for="forum-member-key">受邀者公开身份</label><textarea id="forum-member-key" rows="2"></textarea><button id="forum-admit" class="secondary" type="button">批准并生成入网材料</button><p class="subtle">成员资格默认有效 30 天；管理员可再次批准续期。</p><button id="forum-checkpoint" class="secondary" type="button">签署已同步历史检查点</button><div id="forum-members"></div></details>
+        </div>
+      </section>
       <form id="composer" class="composer" hidden>
+        <div id="image-draft" hidden><img id="image-draft-preview" alt="待发送图片"><span id="image-draft-caption"></span><button id="image-draft-cancel" class="text-button" type="button">移除图片</button></div>
         <div class="compose-row">
           <button
             id="attach"

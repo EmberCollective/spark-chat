@@ -12,6 +12,11 @@ const state = {
   position: "",
   generation: 0,
   files: new Map(),
+  sessions: [],
+  drafts: new Map(),
+  imageDrafts: new Map(),
+  pasteSequence: 0,
+  images: new Map(),
   lastOwn: null,
   lastDay: "",
   connecting: false,
@@ -61,14 +66,35 @@ function avatar(element, peer) {
 }
 function setConnection(connected, label) {
   state.connected = connected;
-  $("host").disabled = connected;
-  $("join").disabled = connected;
+  $("host").disabled = false;
+  $("join").disabled = false;
   $("app").classList.toggle("is-connected", connected);
   $("connection-label").textContent = label;
   $("message").disabled = !connected;
   $("attach").disabled = !connected;
   $("send").disabled = !connected;
 }
+function renderSessions(sessions) {
+  state.sessions = sessions;
+  const picker = $("session-picker");
+  picker.replaceChildren();
+  for (const session of sessions) {
+    const option = document.createElement("option");
+    option.value = session.id;
+    option.textContent = `${session.id.slice(-8)} · ${session.connected ? "在线" : "离线"}`;
+    picker.append(option);
+  }
+  picker.value = state.peer;
+  picker.hidden = sessions.length === 0;
+}
+$("session-picker").addEventListener("change", async (event) => {
+  const id = event.target.value;
+  state.drafts.set(state.peer, $("message").value);
+  event.target.disabled = true;
+  try { enter(await call("select_session", { session_id: id })); }
+  catch (error) { tell(`切换未完成：${error}`); event.target.value = state.peer; }
+  finally { event.target.disabled = false; }
+});
 function authView(create) {
   state.ready = false;
   state.create = create;
@@ -97,6 +123,8 @@ function authView(create) {
   $("passphrase").focus();
 }
 function home() {
+  show("forum-panel", false);
+  show("workspace");
   show("home-button", false);
   show("drop-hint", false);
   show("resume-chat", state.connected || Boolean($("messages").children.length));
@@ -106,6 +134,7 @@ function home() {
   show("composer", false);
 }
 function chat() {
+  if (!$("forum-panel").hidden) return;
   show("home-button");
   show("welcome", false);
   show("connect-panel", false);
@@ -131,27 +160,40 @@ function enter(initial) {
   show("auth", false);
   show("app");
   show("banner", false);
-  state.peer = initial.peer_id || "";
+  state.peer = initial.active_session || initial.peer_id || "";
+  state.files.clear();
+  state.images.clear();
+  if (initial.sessions) renderSessions(initial.sessions);
+  $("message").value = state.drafts.get(state.peer) || "";
+  renderImageDraft();
   avatar($("peer-avatar"), state.peer);
   $("peer-title").textContent = state.peer ? `对方 · ${state.peer.slice(-8)}` : "Spark Chat";
   $("detail-peer").textContent = state.peer || "尚未连接";
   setConnection(Boolean(initial.connected), initial.connected ? "已连接 · 加密通道" : "开始一段加密聊天");
   replaceHistory(initial.history || []);
+  for (const image of initial.images || []) addImage(image);
   for (const file of initial.files || []) {
     addFile(file, file.outgoing);
     if (file.complete) finishFile(file.id, file.outgoing);
     else if (file.failed) failFile(file, file.outgoing);
     else if (file.accepted) acceptFile(file.id);
   }
+  replaceHistory(initial.history || []);
   if (initial.connected || $("messages").children.length) {
     chat();
     bottom();
   } else home();
 }
 function clearChat() {
+  window.dispatchEvent(new Event("spark-locked"));
   state.peer = "";
   state.own = "";
   state.files.clear();
+  state.drafts.clear();
+  state.imageDrafts.clear();
+  state.images.clear();
+  renderImageDraft();
+  renderSessions([]);
   state.lastDay = "";
   state.lastOwn = null;
   $("messages").replaceChildren();
@@ -238,6 +280,7 @@ function replaceHistory(messages) {
   const entries = [
     ...messages.map((message) => ({ ts: message.ts, message })),
     ...state.files.values(),
+    ...state.images.values(),
   ].sort((a, b) => a.ts - b.ts);
   for (const entry of entries) {
     if (entry.message) addText(entry.message, false);
@@ -256,6 +299,38 @@ function bytes(size) {
     : size >= 1024
       ? `${Math.round(size / 1024)} KB`
       : `${size} B`;
+}
+async function addImage(data) {
+  if (state.images.has(data.id)) return;
+  const generation = state.generation;
+  const peer = state.peer;
+  const { row, bubble, time } = messageRow(data.own, data.ts);
+  const label = document.createElement("p");
+  label.textContent = "正在读取图片…";
+  bubble.append(label, time);
+  state.images.set(data.id, { ...data, row, outgoing: data.own });
+  try {
+    const encoded = await call("image_preview", { session_id: peer, id: data.id });
+    if (generation !== state.generation) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(data.mime)) throw new Error("图片格式无效");
+    const image = document.createElement("img");
+    image.className = "chat-photo";
+    image.alt = data.own ? "我发送的图片" : "收到的图片";
+    image.src = `data:${data.mime};base64,${encoded}`;
+    image.addEventListener("load", () => { if (generation === state.generation) bottom(); });
+    label.replaceWith(image);
+    const save = document.createElement("button");
+    save.className = "file-save"; save.type = "button"; save.textContent = "保存图片…";
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const saved = await call("save_image", { session_id: peer, id: data.id });
+        if (saved && generation === state.generation) tell("图片已保存到你选择的位置。");
+      } catch (error) { if (generation === state.generation) tell(`保存失败：${error}`); }
+      finally { save.disabled = false; }
+    });
+    bubble.insertBefore(save, time);
+  } catch (error) { if (generation === state.generation) label.textContent = `图片暂不可用：${error}`; }
 }
 function addFile(data, outgoing) {
   const key = `${outgoing ? "out" : "in"}:${data.id}`;
@@ -377,6 +452,15 @@ function eventReceived(event) {
     return;
   }
   if (!state.ready || (event.payload.revision != null && event.payload.revision <= state.snapshotRevision)) return;
+  if (event.payload.type === "SessionsChanged") {
+    renderSessions(event.payload.data);
+    return;
+  }
+  if (event.payload.type === "SessionEvent") {
+    const wrapped = event.payload.data;
+    if (state.peer && wrapped.session_id !== state.peer) return;
+    event = { payload: { ...wrapped.event, revision: event.payload.revision } };
+  }
   const data = event.payload.data;
   switch (event.payload.type) {
     case "NetPosition":
@@ -413,6 +497,7 @@ function eventReceived(event) {
       break;
     case "SessionReady":
       state.peer = data;
+      $("session-picker").value = data;
       avatar($("peer-avatar"), data);
       $("peer-title").textContent = `对方 · ${data.slice(-8)}`;
       $("detail-peer").textContent = data;
@@ -442,6 +527,9 @@ function eventReceived(event) {
       break;
     case "Msg":
       addText({ own: false, ts: Date.now(), text: data });
+      break;
+    case "Image":
+      addImage(data);
       break;
     case "FileIncoming":
       addFile({ ...data, size: data.size }, false);
@@ -540,6 +628,7 @@ $("cancel-lock").addEventListener("click", () => $("lock-confirm").close());
 $("confirm-lock").addEventListener("click", lockChat);
 $("reconnect").addEventListener("click", home);
 $("resume-chat").addEventListener("click", chat);
+window.addEventListener("spark-forum-close", () => state.peer ? chat() : home());
 $("dismiss-banner").addEventListener("click", () => show("banner", false));
 $("show-details").addEventListener("click", () => {
   $("menu").open = false;
@@ -622,8 +711,47 @@ $("copy-code").addEventListener("click", async () => {
   }
 });
 $("message").addEventListener("input", () => {
+  state.drafts.set(state.peer, $("message").value);
   $("message").style.height = "auto";
   $("message").style.height = `${Math.min(140, $("message").scrollHeight)}px`;
+});
+function renderImageDraft() {
+  const image = state.imageDrafts.get(state.peer);
+  show("image-draft", Boolean(image));
+  if (image) {
+    $("image-draft-preview").src = image.url;
+    $("image-draft-caption").textContent = `${image.name} · ${bytes(image.size)}`;
+  } else $("image-draft-preview").removeAttribute("src");
+}
+$("image-draft-cancel").addEventListener("click", () => {
+  state.pasteSequence += 1;
+  state.imageDrafts.delete(state.peer);
+  renderImageDraft();
+});
+$("message").addEventListener("paste", async event => {
+  const item = [...(event.clipboardData?.items || [])].find(item => item.kind === "file" && item.type.startsWith("image/"));
+  if (!item) return;
+  event.preventDefault();
+  if (!state.connected) { tell("请先连接聊天对象。"); return; }
+  const file = item.getAsFile();
+  if (!file || file.size > 5_000_000) { tell("直接预览图片需在 5 MB 以内；较大图片请作为文件发送。"); return; }
+  if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { tell("仅支持 PNG、JPEG 和 WebP 静态图片。"); return; }
+  const peer = state.peer;
+  const generation = state.generation;
+  const sequence = ++state.pasteSequence;
+  try {
+    const url = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("无法读取剪贴板图片"));
+      reader.readAsDataURL(file);
+    });
+    if (!state.ready || generation !== state.generation || sequence !== state.pasteSequence) return;
+    const prepared = await call("prepare_image", { data: String(url).split(",")[1] });
+    if (!state.ready || generation !== state.generation || sequence !== state.pasteSequence) return;
+    state.imageDrafts.set(peer, { url: `data:${prepared.mime};base64,${prepared.data}`, data: prepared.data, size: file.size, name: file.name || "粘贴图片" });
+    renderImageDraft();
+  } catch (error) { tell(error); }
 });
 $("message").addEventListener("keydown", (event) => {
   if (
@@ -640,20 +768,29 @@ $("message").addEventListener("keydown", (event) => {
 $("composer").addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = $("message").value.trim();
-  if (!text || !state.connected || $("send").disabled) return;
+  const image = state.imageDrafts.get(state.peer);
+  if ((!text && !image) || !state.connected || $("send").disabled) return;
   if (new TextEncoder().encode(text).length > 1048576) {
     tell("这条消息太长了，请拆成几条发送。");
     return;
   }
   const generation = state.generation;
   const original = $("message").value;
+  const peer = state.peer;
   $("send").disabled = true;
   try {
-    const message = await call("text", { text });
+    if (image) {
+      const sent = await call("image", { session_id: peer, data: image.data });
+      if (state.imageDrafts.get(peer) === image) state.imageDrafts.delete(peer);
+      if (generation === state.generation) { addImage(sent); renderImageDraft(); }
+    }
+    const message = text ? await call("text", { text, session_id: peer }) : null;
+    if (state.drafts.get(peer) === original) state.drafts.delete(peer);
     if (generation !== state.generation) return;
-    addText(message);
+    if (message) addText(message);
     if ($("message").value === original) {
       $("message").value = "";
+      state.drafts.delete(peer);
       $("message").style.height = "";
     }
     $("message").focus();
@@ -667,7 +804,7 @@ $("attach").addEventListener("click", async () => {
   const generation = state.generation;
   $("attach").disabled = true;
   try {
-    await call("send_file");
+    await call("send_file", { session_id: state.peer });
   } catch (e) {
     if (generation === state.generation) tell(`文件未发送：${e}`);
   } finally {

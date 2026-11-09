@@ -22,6 +22,7 @@ struct RevisionedEvent<'a> {
 }
 
 type Backend = Arc<Mutex<App>>;
+type ForumBackend = Arc<Mutex<Option<crate::forum::service::ForumService>>>;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -39,11 +40,44 @@ enum Request {
     },
     Text {
         text: String,
+        session_id: Option<String>,
+    },
+    SelectSession {
+        session_id: String,
+    },
+    PrepareImage {
+        data: String,
+    },
+    Image {
+        session_id: String,
+        data: String,
+    },
+    ImagePreview {
+        session_id: String,
+        id: String,
+    },
+    SaveImage {
+        session_id: String,
+        id: String,
+    },
+    Forum {
+        command: Value,
+    },
+    ForumAttach,
+    ForumSave {
+        hash: String,
+        name: String,
+        size: u64,
+    },
+    ForumPreview {
+        hash: String,
     },
     PickKeyfile {
         create: bool,
     },
-    SendFile,
+    SendFile {
+        session_id: Option<String>,
+    },
     OpenFile {
         id: String,
     },
@@ -59,18 +93,84 @@ enum Request {
 async fn dispatch(
     handle: tauri::AppHandle,
     state: tauri::State<'_, Backend>,
+    forum_state: tauri::State<'_, ForumBackend>,
     request: Request,
 ) -> Result<Value, String> {
     let backend = state.inner().clone();
+    let forum_backend = forum_state.inner().clone();
     // 原生对话框、口令派生与磁盘写入都不占用 WebView 的界面线程。
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        if let Request::Forum { mut command } = request {
+            use zeroize::Zeroize;
+            let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+            let (mut seed, directory) = app.forum_material()?;
+            let mut forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+            if forum.is_none() {
+                let mut storage_key = [0u8; 32];
+                hkdf::Hkdf::<sha2::Sha256>::new(None, &seed)
+                    .expand(b"SparkNet/forum/local-storage/v1", &mut storage_key).map_err(|_| "无法初始化论坛存储")?;
+                let started = crate::forum::service::ForumService::start(seed, storage_key, directory.join("forum"));
+                seed.zeroize();
+                storage_key.zeroize();
+                *forum = Some(started.map_err(|e| e.to_string())?);
+            }
+            seed.zeroize();
+            drop(app);
+            let object = command.as_object_mut().ok_or("论坛操作无效")?;
+            if let Some(kind) = object.remove("kind") { object.insert("action".into(), kind); }
+            let command = serde_json::from_value(command).map_err(|_| "论坛操作格式无效")?;
+            return forum.as_ref().ok_or("论坛尚未启动")?.handle(command).map_err(|e| e.to_string());
+        }
+        if matches!(&request, Request::Lock) {
+            // Use the same lock order as forum startup; no forum operation outlives lock completion.
+            let mut app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+            forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?.take();
+            app.lock();
+            return Ok(Value::Null);
+        }
         #[cfg(target_os = "android")]
-        if let Some(result) = android::dispatch(&handle, &backend, &request) {
+        if let Some(result) = android::dispatch(&handle, &backend, &forum_backend, &request) {
             return result;
         }
         #[cfg(not(target_os = "android"))]
         let _ = handle;
         match request {
+            Request::ForumPreview { ref hash } => {
+                use base64::Engine;
+                let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+                app.forum_material()?;
+                let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+                drop(app);
+                let result = forum.as_ref().ok_or("论坛尚未启动")?.read_preview(hash.clone()).map_err(|e| e.to_string())?;
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(result["bytes"].as_str().ok_or("预览数据无效")?).map_err(|_| "预览数据无效")?;
+                let image = crate::images::validate_and_normalize(&bytes).map_err(|e| e.to_string())?;
+                return Ok(json!({"mime":image.mime,"data":base64::engine::general_purpose::STANDARD.encode(image.bytes)}));
+            }
+            #[cfg(not(target_os = "android"))]
+            Request::ForumAttach => {
+                let Some(path) = rfd::FileDialog::new().pick_file() else { return Ok(Value::Null); };
+                let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+                app.forum_material()?;
+                let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+                drop(app);
+                let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+                let name = path.file_name().and_then(|s|s.to_str()).unwrap_or("附件").to_owned();
+                return forum.as_ref().ok_or("请先加入论坛")?.attach(name,file).map_err(|e|e.to_string());
+            }
+            #[cfg(not(target_os = "android"))]
+            Request::ForumSave { ref hash, ref name, size } => {
+                if size > 20_000_000 { return Err("附件超过大小限制".into()); }
+                let name = std::path::Path::new(name).file_name().and_then(|s|s.to_str()).unwrap_or("附件");
+                let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() else { return Ok(Value::Null); };
+                let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+                app.forum_material()?;
+                let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+                drop(app);
+                let target = crate::transfer::ReceiveTarget::path(&path,size).map_err(|e|e.to_string())?;
+                forum.as_ref().ok_or("请先加入论坛")?.export(hash.clone(),target.file.try_clone().map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+                target.commit().map_err(|e|e.to_string())?;
+                return Ok(json!(path.to_string_lossy()));
+            }
             #[cfg(not(target_os = "android"))]
             Request::PickKeyfile { create } => {
                 let dialog = rfd::FileDialog::new().set_file_name("spark.keyfile");
@@ -82,14 +182,32 @@ async fn dispatch(
                 return Ok(json!(path.map(|p| p.to_string_lossy().into_owned())));
             }
             #[cfg(not(target_os = "android"))]
-            Request::SendFile => {
+            Request::SaveImage { ref session_id, ref id } => {
+                use std::io::Write;
+                let extension = {
+                    let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
+                    let bytes = image_bytes(&app, session_id, id)?;
+                    if image::guess_format(&bytes).ok() == Some(image::ImageFormat::Png) { "png" } else { "jpg" }
+                };
+                let Some(path) = rfd::FileDialog::new().set_file_name(format!("聊天图片.{extension}")).save_file() else { return Ok(Value::Null); };
+                let bytes = image_bytes(&*backend.lock().map_err(|_| "聊天服务暂时不可用")?, session_id, id)?;
+                let mut target = crate::transfer::ReceiveTarget::path(&path, bytes.len() as u64).map_err(|e| e.to_string())?;
+                target.file.write_all(&bytes).map_err(|e| e.to_string())?;
+                target.commit().map_err(|e| e.to_string())?;
+                return Ok(json!(path.to_string_lossy()));
+            }
+            #[cfg(not(target_os = "android"))]
+            Request::SendFile { ref session_id } => {
+                let target = session_id.clone().unwrap_or_else(|| {
+                    backend.lock().map(|app| app.initial_state().peer_id).unwrap_or_default()
+                });
                 let Some(path) = rfd::FileDialog::new().pick_file() else {
                     return Ok(Value::Null);
                 };
                 backend
                     .lock()
                     .map_err(|_| "聊天服务暂时不可用")?
-                    .send_path(&path)?;
+                    .send_path_to(&target, &path)?;
                 return Ok(Value::Null);
             }
             #[cfg(not(target_os = "android"))]
@@ -172,12 +290,38 @@ async fn dispatch(
                 app.connect(&code)?;
                 Ok(Value::Null)
             }
-            Request::Text { text } => app.text(&text).map(|v| json!(v)),
+            Request::Text { text, session_id } => match session_id {
+                Some(id) => app.text_to(&id, &text).map(|v| json!(v)),
+                None => app.text(&text).map(|v| json!(v)),
+            },
+            Request::SelectSession { session_id } => app.select_session(&session_id).map(|v| json!(v)),
+            Request::PrepareImage { data } => {
+                use base64::Engine;
+                if app.initial_state().my_id.is_empty() { return Err("请先解锁".into()); }
+                if data.len() > 6_666_668 { return Err("图片超过 5 MB".into()); }
+                let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "图片数据无效")?;
+                let image = crate::images::validate_and_normalize(&bytes).map_err(|e| e.to_string())?;
+                Ok(json!({"mime": image.mime, "data": base64::engine::general_purpose::STANDARD.encode(image.bytes)}))
+            }
+            Request::Image { session_id, data } => {
+                use base64::Engine;
+                if data.len() > 6_666_668 { return Err("图片超过 5 MB".into()); }
+                let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "图片数据无效")?;
+                app.image_to(&session_id, &bytes).map(|v| json!(v))
+            }
+            Request::ImagePreview { session_id, id } => app.image_preview(&session_id, &id).map(|v| json!(v)),
             _ => unreachable!("原生对话框分支已返回"),
         }
     })
     .await
     .map_err(|_| "操作未完成，请重试".to_owned())?
+}
+
+fn image_bytes(app: &App, peer: &str, id: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(app.image_preview(peer, id)?)
+        .map_err(|_| "图片缓存数据无效".into())
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -227,6 +371,7 @@ pub fn run() -> anyhow::Result<()> {
             #[cfg(not(target_os = "android"))]
             let backend = App::new();
             app.manage(Arc::new(Mutex::new(backend)) as Backend);
+            app.manage(Arc::new(Mutex::new(None)) as ForumBackend);
             let state = app.state::<Backend>().inner().clone();
             let handle = app.handle().clone();
             std::thread::Builder::new()
@@ -256,6 +401,11 @@ pub fn run() -> anyhow::Result<()> {
     app.run(move |handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             stopped.store(true, Ordering::Relaxed);
+            if let Some(state) = handle.try_state::<ForumBackend>() {
+                if let Ok(mut forum) = state.lock() {
+                    forum.take();
+                }
+            }
             if let Some(state) = handle.try_state::<Backend>() {
                 if let Ok(mut app) = state.lock() {
                     app.lock();

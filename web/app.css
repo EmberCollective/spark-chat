@@ -865,4 +865,11 @@ dd {
 
 .drop-hint { position: absolute; inset: 12px; z-index: 10; border: 2px dashed var(--accent, #108567); border-radius: 18px; background: #eef9f2f5; display: grid; place-items: center; color: #12624c; font-size: 20px; pointer-events: none; }
 .workspace { position: relative; }
+#session-picker { max-width: 170px; min-height: 48px; border: 1px solid #d4ded8; border-radius: 10px; background: #fff; color: inherit; padding: 6px; }
+.section-nav { display:flex; gap:12px; align-items:center; flex-shrink:0; padding:4px 16px; background:#f8fbf9; border-bottom:1px solid #dce5df; }
+#image-draft { display:flex; align-items:center; gap:12px; padding:8px; }
+#image-draft[hidden] { display:none; }
+#image-draft-preview { width:80px; height:80px; object-fit:contain; }
+.chat-photo { display:block; max-width:100%; max-height:360px; border-radius:10px; object-fit:contain; }
+@media (max-width: 480px) { #session-picker { max-width: 112px; font-size: 12px; } }
 .file-cancel { border: 0; background: transparent; color: inherit; padding: 10px 12px; min-height: 48px; text-decoration: underline; cursor: pointer; }

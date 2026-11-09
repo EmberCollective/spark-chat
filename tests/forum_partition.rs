@@ -49,6 +49,7 @@ fn publish(
         parents,
         title: title.into(),
         body: body.into(),
+        attachments: vec![],
     })
     .unwrap();
 }
