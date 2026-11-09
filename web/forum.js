@@ -296,7 +296,7 @@
       if(opening){const rect=more.getBoundingClientRect();menu.style.left=`${Math.max(8,Math.min(rect.right-220,window.innerWidth-228))}px`;menu.style.top=`${Math.max(8,Math.min(rect.bottom+6,window.innerHeight-menu.offsetHeight-8))}px`;}
     });more.className="";more.setAttribute("aria-label","帖子更多操作");head.append(more);content.append(head);
     const menu=node("div",undefined,"post-menu");menu.hidden=true;menu.setAttribute("role","menu");content.append(menu);
-    const dialog=node("dialog",undefined,"post-info-dialog");const dialogTitle=node("h2"),dialogBody=node("div");const close=button("关闭",()=>dialog.close());const closeBar=node("div",undefined,"bottom-actions");closeBar.append(close);dialog.append(dialogTitle,dialogBody,closeBar);content.append(dialog);
+    const dialog=node("dialog",undefined,"post-info-dialog");const dialogTitle=node("h2"),dialogBody=node("div");const close=button("关闭",()=>dialog.close());const closeBar=node("div",undefined,"bottom-actions");closeBar.append(close);dialog.append(dialogTitle,dialogBody,closeBar);content.append(dialog);dialog.addEventListener("close",()=>{if(snapshot&&page==="thread"&&selected)renderDetail();});
     function action(label,callback){const item=button(label,()=>{menu.hidden=true;callback();});item.className="";item.setAttribute("role","menuitem");menu.append(item);return item;}
     function info(label,build){action(label,()=>{dialogTitle.textContent=label;dialogBody.replaceChildren();build(dialogBody);dialog.showModal();});}
     if(topic.heads.length>1)content.append(node("p",topic.merged_body!=null?"并发修改已自动组合，原始版本已保留。":"存在并发修改，请查看各版本或提交合并。","forum-conflict"));
@@ -344,6 +344,8 @@
   }
   document.addEventListener("click",event=>{if(!event.target.closest(".post-menu")&&!event.target.closest('[aria-label="帖子更多操作"]'))for(const menu of panel.querySelectorAll(".post-menu"))menu.hidden=true;});
   function renderDetail() {
+    // Background sync must not dismiss an open form or discard its input.
+    if(detail.querySelector(".post-info-dialog[open]"))return;
     detail.replaceChildren();const topic=snapshot?.topics?.find(t=>t.id===selected);if(!topic)return;
     const crumb=node("div",undefined,"crumb"),home=button("所有主题",goHome);home.className="";crumb.append(home,document.createTextNode(` / ${snapshot.categories?.[topic.category]||"综合"}`));detail.append(crumb,node("h1",topic.title||"未命名主题"));
     const meta=node("div",undefined,"meta");meta.append(node("span",snapshot.categories?.[topic.category]||"综合","badge"),node("span",`${snapshot.reply_total||0} 条回复`),node("span",topic.locked?"已锁定":"讨论中"));detail.append(meta);list.hidden=true;

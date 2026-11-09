@@ -139,7 +139,7 @@
       check($("forum-detail").querySelector("dialog[open]").textContent.includes("版本："),"签名版本证据可从更多菜单按需查看");pageButton($("forum-detail").querySelector("dialog[open]"),"关闭").click();
       openPostAction("查看修改历史");check($("forum-detail").querySelector("dialog[open]").textContent.includes("原文"),"历史原始版本在同风格对话框保留");pageButton($("forum-detail").querySelector("dialog[open]"),"关闭").click();
       openPostAction("举报");const reportDialog=$("forum-detail").querySelector("dialog[open]");reportDialog.querySelector("textarea").value="测试举报";pageButton(reportDialog,"提交举报").click();await tick();
-      check(reportDialog.open&&reportDialog.querySelector("textarea").value==="测试举报"&&reportDialog.textContent.includes("测试举报失败"),"举报失败保留原因输入并显示错误");failReport=false;pageButton(reportDialog,"提交举报").click();await tick();
+      check(reportDialog.open&&reportDialog.querySelector("textarea").value==="测试举报"&&reportDialog.textContent.includes("测试举报失败"),"举报失败保留原因输入并显示错误");forum.peers+=1;$("forum-refresh").click();await tick();check(reportDialog.open&&reportDialog.querySelector("textarea").value==="测试举报","后台同步不关闭举报表单或丢失输入");failReport=false;pageButton(reportDialog,"提交举报").click();await tick();
       check(calls.some(c=>c.action==="forum"&&c.command.kind==="report"&&c.command.reason==="测试举报"),"举报使用社区署名接口及同风格表单");
       openPostAction("管理此主题");
       const categorySelect=$("forum-detail").querySelector('select[aria-label="设置主题版块"]');
