@@ -96,6 +96,22 @@ pub enum ForumRequest {
     Revoke {
         member: String,
     },
+    Category {
+        id: String,
+        title: String,
+    },
+    Categorize {
+        target: String,
+        category: String,
+    },
+    Lock {
+        target: String,
+        locked: bool,
+    },
+    Report {
+        target: String,
+        reason: String,
+    },
     Moderate {
         target: String,
         hidden: bool,
@@ -551,10 +567,10 @@ impl Worker {
                             None
                         }
                     });
-                topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body(&topic.root).ok().flatten()}));
+                topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"locked":topic.locked,"category":topic.category,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body(&topic.root).ok().flatten()}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"categories":self.view.categories,"reports":if self.saved.as_ref().is_some_and(|s|s.forum.admin==self.key.public().encode_protobuf()){self.view.reports.iter().map(|r|json!({"id":hex(&r.id),"target":hex(&r.target),"author":URL_SAFE_NO_PAD.encode(&r.author),"reason":r.reason})).collect::<Vec<_>>()}else{vec![]},"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
     }
     fn search(&self, query: &str, offset: usize) -> Result<Value> {
         let query = query.trim();
@@ -841,7 +857,13 @@ impl Worker {
                     .as_deref()
                     .map(decode_public)
                     .transpose()?
-                    .unwrap_or_else(|| self.key.public().encode_protobuf());
+                    .unwrap_or_else(|| {
+                        self.view
+                            .members
+                            .get(&member)
+                            .map(|m| m.inviter.clone())
+                            .unwrap_or_else(|| self.key.public().encode_protobuf())
+                    });
                 let expires_at = expires_at.unwrap_or(now() + 30 * 86400);
                 ensure!(expires_at > now(), "有效期必须晚于当前时间");
                 self.govern(GovernanceChange::Admit {
@@ -865,6 +887,56 @@ impl Worker {
                 self.govern(GovernanceChange::Revoke {
                     member: decode_public(&member)?,
                 })?;
+            }
+            ForumRequest::Category { id, title } => {
+                self.govern(GovernanceChange::Category { id, title })?;
+            }
+            ForumRequest::Categorize { target, category } => {
+                self.govern(GovernanceChange::AssignCategory {
+                    target: parse_hash(&target)?,
+                    category,
+                })?;
+            }
+            ForumRequest::Lock { target, locked } => {
+                let target = parse_hash(&target)?;
+                let mut heads = if locked {
+                    self.view
+                        .topics
+                        .iter()
+                        .filter(|t| t.root == target || t.reply_to == Some(target))
+                        .flat_map(|t| t.heads.iter().copied())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                heads.sort();
+                heads.dedup();
+                self.govern(GovernanceChange::Lock {
+                    target,
+                    locked,
+                    heads,
+                })?;
+            }
+            ForumRequest::Report { target, reason } => {
+                ensure!(
+                    self.allowed(&self.key.public().to_peer_id()),
+                    "没有举报权限"
+                );
+                let target = parse_hash(&target)?;
+                let saved = self.saved.as_mut().unwrap();
+                let mut candidate = saved.forum.clone();
+                let record = sign_record(
+                    &self.key,
+                    candidate.network,
+                    Action::Report { target, reason },
+                )?;
+                let id = candidate.ingest(record)?;
+                ensure!(
+                    !candidate.rebuild().pending.contains(&id),
+                    "举报目标尚未验证"
+                );
+                saved.forum = candidate;
+                self.refresh();
             }
             ForumRequest::Moderate { target, hidden } => {
                 self.govern(GovernanceChange::Moderate {
