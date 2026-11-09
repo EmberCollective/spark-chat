@@ -480,3 +480,48 @@ fn admission_renewal_preserves_first_inviter_and_prevents_cycles() {
     assert!(f.rebuild().pending.contains(&id));
     assert!(!f.rebuild().members.contains_key(&pk(8)));
 }
+
+#[test]
+fn expiration_quarantines_unconfirmed_content_and_preserves_checkpoint_history() {
+    let mut f = fixture();
+    let original = post(&mut f, 2, None, vec![], "已确认历史");
+    let root = f.ingest(original).unwrap();
+    let checkpoint = gov(
+        &f,
+        GovernanceChange::Checkpoint {
+            records: vec![root],
+        },
+    );
+    f.ingest(checkpoint).unwrap();
+    let update = post(&mut f, 2, Some(root), vec![root], "过期后转发的编辑");
+    let update_id = f.ingest(update).unwrap();
+    let descendant = post(&mut f, 1, Some(root), vec![update_id], "仍有效成员的后继");
+    let descendant_id = f.ingest(descendant).unwrap();
+    assert!(!f.can_access(&pk(2), 1000));
+    assert!(f.rebuild_at(999).disputed.is_empty());
+    let view = f.rebuild_at(1000);
+    assert!(!view.disputed.contains(&root));
+    assert!(view.disputed.contains(&update_id));
+    assert!(view.disputed.contains(&descendant_id));
+    assert_eq!(view.topics[0].heads, vec![root]);
+    let new_post = post(&mut f, 2, None, vec![], "过期的新主题");
+    let new_id = f.ingest(new_post).unwrap();
+    assert!(f.rebuild_at(1001).disputed.contains(&new_id));
+}
+
+#[test]
+fn automatic_merge_excludes_expired_unconfirmed_branches() {
+    let mut f = fixture();
+    let original = post(&mut f, 1, None, vec![], "a\nb\nc\n");
+    let root = f.ingest(original).unwrap();
+    let left = post(&mut f, 1, Some(root), vec![root], "A\nb\nc\n");
+    f.ingest(left).unwrap();
+    let right = post(&mut f, 2, Some(root), vec![root], "a\nb\nC\n");
+    f.ingest(right).unwrap();
+    assert_eq!(
+        f.merged_body_at(&root, 999).unwrap().as_deref(),
+        Some("A\nb\nC\n")
+    );
+    assert!(f.merged_body_at(&root, 1000).unwrap().is_none());
+    assert_eq!(f.rebuild_at(1000).topics[0].heads.len(), 1);
+}

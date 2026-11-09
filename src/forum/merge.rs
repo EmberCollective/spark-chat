@@ -5,7 +5,11 @@ impl Forum {
     /// Returns a derived body only for two valid heads with one unambiguous merge base.
     /// None leaves the original branches visible, including missing bodies and conflicts.
     pub fn merged_body(&self, root: &Digest) -> Result<Option<String>> {
-        let view = self.rebuild();
+        self.merged_body_at(root, 0)
+    }
+
+    pub fn merged_body_at(&self, root: &Digest, now: u64) -> Result<Option<String>> {
+        let view = self.rebuild_at(now);
         let Some(topic) = view.topics.iter().find(|topic| &topic.root == root) else {
             return Ok(None);
         };

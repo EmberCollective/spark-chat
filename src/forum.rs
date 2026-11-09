@@ -334,7 +334,7 @@ impl Forum {
     }
 
     pub fn can_access(&self, author: &[u8], now: u64) -> bool {
-        let view = self.rebuild();
+        let view = self.rebuild_at(now);
         !view.governance_conflict
             && view
                 .members
@@ -353,7 +353,13 @@ impl Forum {
         missing.into_iter().take(512).collect()
     }
 
+    /// Structural view without expiry evaluation; live services must use `rebuild_at`.
     pub fn rebuild(&self) -> ForumView {
+        self.rebuild_at(0)
+    }
+
+    /// Use the receiving node's current time, never a timestamp supplied by an author.
+    pub fn rebuild_at(&self, now: u64) -> ForumView {
         let mut view = ForumView::default();
         view.members.insert(
             self.admin.clone(),
@@ -554,7 +560,9 @@ impl Forum {
                     });
                 if locked_out
                     || view.governance_conflict
-                    || (view.members[&signed.record.author].revoked && !confirmed.contains(id))
+                    || ((view.members[&signed.record.author].revoked
+                        || view.members[&signed.record.author].expires_at <= now)
+                        && !confirmed.contains(id))
                     || parents.iter().any(|p| disputed.contains(p))
                     || reply_to.is_some_and(|r| disputed.contains(&r))
                 {
@@ -611,6 +619,7 @@ impl Forum {
                     {
                         view.pending.push(*id);
                     } else if view.members[&signed.record.author].revoked
+                        || view.members[&signed.record.author].expires_at <= now
                         || view.governance_conflict
                     {
                         disputed.insert(*id);
