@@ -16,6 +16,9 @@
   const requested = new Set();
   let attachments = [];
   let draftTimer;
+  let searchTimer;
+  let searchResult = null;
+  let searchGeneration = 0;
   let draftSave = Promise.resolve();
   const $f = id => document.getElementById(id);
   const command = cmd => window.__TAURI__.core.invoke("dispatch", {
@@ -79,23 +82,38 @@
       ? `${data.peers || 0} 个连接 · ${data.pending || 0} 条记录待补齐 · ${data.disputed || 0} 条争议记录`
       : "先创建论坛，或导入管理员提供的入网材料。";
     renderTopics();
-    if (selected) renderDetail();
+    if (selected && !$f("forum-search").value.trim()) renderDetail();
     const members = $f("forum-members");
     members.replaceChildren();
     for (const member of data.members || []) {
       const row = node("div", undefined, "forum-member");
-      row.append(node("code", member.id), node("span", member.active ? "有效" : "已吊销"));
+      row.append(node("code", member.id), node("span", ({active:"有效",expired:"已到期",revoked:"已吊销"}[member.status] || (member.active ? "有效" : "不可用"))));
       if (data.admin && member.active && member.id !== data.own_public) {
         row.append(button("吊销资格", () => {
           if (confirm(`吊销 ${member.id} 的论坛资格？未被检查点确认的修改会进入争议状态。此操作由你的管理身份签署。`)) run({ kind: "revoke", member: member.id });
         }));
       }
+      if (member.inviter) row.append(node("span", `邀请者 ${member.inviter.slice(-8)}`));
       members.append(row);
     }
   }
   function renderTopics() {
     const query = $f("forum-search").value.trim().toLowerCase();
     list.replaceChildren();
+    if (query && searchResult) {
+      list.hidden = false; detail.replaceChildren();
+      for (const result of searchResult.results) {
+        const row = node("button", undefined, "forum-topic"); row.type = "button";
+        row.append(node("strong", result.title), node("span", result.excerpt || "正文未缓存", "subtle"));
+        row.addEventListener("click", async () => {
+          $f("forum-search").value = ""; searchResult = null; selected = result.topic_id;
+          await run({kind:"topic",id:result.topic_id,offset:0}); renderDetail();
+        }); list.append(row);
+      }
+      if (!searchResult.results.length) list.append(node("p", "已同步标题与本机正文中没有匹配内容。", "subtle"));
+      paginate(list, searchResult.offset, searchResult.total, offset => search(offset));
+      return;
+    }
     const topics = (snapshot?.topics || []).filter(t => !t.reply_to && (!t.hidden || snapshot.admin) &&
       (!query || t.title.toLowerCase().includes(query) || t.versions.some(v => v.body?.toLowerCase().includes(query))));
     for (const topic of topics) {
@@ -149,10 +167,11 @@
     for (const version of topic.versions || []) {
       const section = node("section", undefined, "forum-version");
       section.append(node("p", `修改者 ${version.author.slice(-8)} · ${version.id.slice(0, 12)}`, "subtle"));
+      if (version.body_copies != null) section.append(node("p", version.body_copies > 1 ? `正文 ${version.body_copies} 份当前在线副本（含本机）` : version.body != null ? "正文仅本机保存，等待其他节点确认" : "正文尚未缓存", "subtle"));
       if (version.body != null) section.append(bodyView(version.body));
       else section.append(button("查找并获取正文", () => run({ kind: "fetch", hash: version.body_hash })));
       for (const attachment of version.attachments || []) {
-        section.append(button(`${attachment.name} · ${(attachment.size / 1e6).toFixed(2)} MB · ${attachment.ready ? "保存文件" : "查找副本"}`, async () => {
+        section.append(button(`${attachment.name} · ${(attachment.size / 1e6).toFixed(2)} MB · ${attachment.ready ? "保存文件" : "查找副本"}${attachment.copies != null ? ` · ${attachment.copies} 份在线副本` : ""}`, async () => {
           if (!attachment.ready) { await run({ kind: "fetch", hash: attachment.hash }); return; }
           try {
             const saved = await window.__TAURI__.core.invoke("dispatch",{request:{action:"forum_save",hash:attachment.hash,name:attachment.name,size:attachment.size}});
@@ -230,7 +249,20 @@
   });
   $f("forum-close").addEventListener("click", () => { panel.hidden = true; $f("workspace").hidden = false; window.dispatchEvent(new Event("spark-forum-close")); });
   $f("forum-refresh").addEventListener("click", () => run({ kind: "sync" }));
-  $f("forum-search").addEventListener("input", renderTopics);
+  async function search(offset = 0) {
+    const query = $f("forum-search").value.trim();
+    const generation = ++searchGeneration, lockedGeneration = epoch;
+    if (!query) { searchResult = null; renderTopics(); return; }
+    try {
+      const result = await command({kind:"search",query,offset});
+      if (generation !== searchGeneration || lockedGeneration !== epoch) return;
+      searchResult = result.search; renderTopics();
+    } catch(error) { if (generation === searchGeneration) note(error); }
+  }
+  $f("forum-search").addEventListener("input", () => {
+    clearTimeout(searchTimer); searchGeneration++;
+    searchTimer = setTimeout(() => search(), 250);
+  });
   $f("forum-new").addEventListener("click", () => openEditor());
   $f("forum-cancel").addEventListener("click", () => { editor.hidden = true; });
   function renderAttachments() {
@@ -257,7 +289,7 @@
   $f("forum-join").addEventListener("click", () => run({ kind: "join", code: $f("forum-join-code").value.trim() }));
   $f("forum-listen").addEventListener("click", () => run({ kind: "listen" }));
   $f("forum-connect").addEventListener("click", () => run({ kind: "connect", code: $f("forum-peer-code").value.trim() }));
-  $f("forum-admit").addEventListener("click", () => run({ kind: "admit", member: $f("forum-member-key").value.trim() }));
+  $f("forum-admit").addEventListener("click", () => run({ kind: "admit", member: $f("forum-member-key").value.trim(), inviter: $f("forum-inviter").value.trim() || null }));
   $f("forum-checkpoint").addEventListener("click", async()=>{
     const records=[...new Set((snapshot?.topics||[]).flatMap(t=>t.versions.filter(v=>!v.disputed).map(v=>v.id)))].sort();
     if(!records.length){note("没有可确认的已同步历史。");return;}
@@ -293,7 +325,7 @@
   });
   window.addEventListener("spark-locked", () => {
     epoch += 1; rendered = ""; requested.clear();
-    clearTimeout(draftTimer);
+    clearTimeout(draftTimer); clearTimeout(searchTimer); searchGeneration++; searchResult = null;
     attachments=[];renderAttachments();
     snapshot = null; selected = null; parents = [];
     panel.hidden = true; detail.replaceChildren(); list.replaceChildren();
