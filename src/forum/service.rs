@@ -15,6 +15,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroize;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -68,17 +69,29 @@ struct Command {
     reply: mpsc::SyncSender<Result<Value>>,
 }
 pub struct ForumService {
-    tx: mpsc::SyncSender<Command>,
+    tx: Option<mpsc::SyncSender<Command>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for ForumService {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 impl ForumService {
     pub fn start(seed: [u8; 32], storage_key: [u8; 32], directory: PathBuf) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel(16);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("spark-forum".into())
             .spawn(move || {
                 let result = (|| -> Result<_> {
-                    let key = Keypair::ed25519_from_bytes(seed)?;
+                    let mut seed = seed;
+                    let result = Keypair::ed25519_from_bytes(seed);
+                    seed.zeroize();
+                    let key = result?;
                     Worker::new(key, storage_key, directory)
                 })();
                 match result {
@@ -109,12 +122,17 @@ impl ForumService {
                 }
             })?;
         ready_rx.recv_timeout(Duration::from_secs(10))??;
-        Ok(Self { tx })
+        Ok(Self {
+            tx: Some(tx),
+            thread: Some(thread),
+        })
     }
     /// Call from a blocking task, never while holding the application's UI mutex.
     pub fn handle(&self, request: ForumRequest) -> Result<Value> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("论坛已关闭"))?
             .try_send(Command { request, reply: tx })
             .map_err(|_| anyhow::anyhow!("论坛操作排队已满或已锁定"))?;
         rx.recv_timeout(Duration::from_secs(10))
@@ -158,6 +176,29 @@ struct Worker {
     rates: HashMap<PeerId, (Instant, u32)>,
     dirty: bool,
     status: String,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.storage_key.zeroize();
+        if let Some(saved) = &mut self.saved {
+            saved.name.zeroize();
+            for body in saved.forum.bodies.values_mut() {
+                body.zeroize();
+            }
+            for record in saved.forum.records.values_mut() {
+                if let Action::Content {
+                    title, attachments, ..
+                } = &mut record.record.action
+                {
+                    title.zeroize();
+                    for attachment in attachments {
+                        attachment.name.zeroize();
+                    }
+                }
+            }
+        }
+    }
 }
 pub fn hex(hash: &Digest) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
@@ -282,7 +323,8 @@ impl Worker {
             Action::Governance { sequence, .. } => sequence,
             _ => 0,
         });
-        records.truncate(256);
+        // Local governance creation is explicitly capped at 256 records in v1.
+        // Never silently omit a later signed revocation from a received chain.
         records
     }
     fn state(&self) -> Value {
@@ -333,6 +375,9 @@ impl Worker {
                 matches!(record.record.action, Action::Governance { .. }),
                 "身份握手仅接受治理记录"
             );
+            if let Action::Governance { sequence, .. } = record.record.action {
+                ensure!(sequence <= 256, "一期治理记录容量已满");
+            }
             saved.forum.ingest(record)?;
         }
         self.refresh();
@@ -758,8 +803,9 @@ impl Worker {
                 event=swarm.select_next_some()=>match event{
                     SwarmEvent::NewListenAddr{address,..}=>{if campus_address(&address)&&self.listen.len()<8&&!self.listen.contains(&address){self.listen.push(address);}},
                     SwarmEvent::ExpiredListenAddr{address,..}=>{self.listen.retain(|a|a!=&address);},
-                    SwarmEvent::ConnectionEstablished{peer_id,..}=>{
-                        if self.peers.len()>=8{let _=swarm.disconnect_peer_id(peer_id);}else{self.peers.insert(peer_id);self.enqueue(peer_id,Query::Hello{governance:self.governance()});}
+                    SwarmEvent::ConnectionEstablished{peer_id,endpoint,..}=>{
+                        let local = matches!(endpoint.get_remote_address().iter().next(),Some(Protocol::Ip4(ip)) if ip.is_private() || ip.is_loopback());
+                        if !local || self.peers.len()>=8{let _=swarm.disconnect_peer_id(peer_id);}else{self.peers.insert(peer_id);self.enqueue(peer_id,Query::Hello{governance:self.governance()});}
                     }
                     SwarmEvent::ConnectionClosed{peer_id,num_established:0,..}=>{self.peers.remove(&peer_id);self.queues.remove(&peer_id);self.rates.remove(&peer_id);self.requests.retain(|_,p|p.peer!=peer_id);},
                     SwarmEvent::Behaviour(Event::Message{peer,message,..})=>match message{
@@ -773,7 +819,7 @@ impl Worker {
             }
         }
         let _ = self.persist();
-        self.storage_key.fill(0);
+        self.storage_key.zeroize();
     }
 }
 
