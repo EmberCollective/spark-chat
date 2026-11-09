@@ -85,10 +85,15 @@
     filter.replaceChildren(); const all = node("option", "全部版块"); all.value = ""; filter.append(all);
     for (const [id,title] of Object.entries(data.categories || {})) { const option = node("option",title); option.value=id;filter.append(option); }
     filter.value = selectedCategory;
+    const downloads = $f("forum-downloads"); downloads.replaceChildren();
+    for (const task of data.downloads || []) {
+      const row = node("div", undefined, "forum-member");
+      row.append(node("span", `附件 ${task.hash.slice(0,8)}：${(task.received/1e6).toFixed(2)} / ${(task.size/1e6).toFixed(2)} MB`), button("取消下载", () => run({kind:"cancel_fetch",hash:task.hash}))); downloads.append(row);
+    }
     const reports = $f("forum-reports"); reports.replaceChildren();
     for (const report of data.reports || []) {
       const item = node("div"); item.append(node("p", `${report.author.slice(-8)}：${report.reason}`));
-      item.append(button("查看被举报内容", () => run({kind:"topic",id:report.target,offset:0}))); reports.append(item);
+      item.append(button("查看被举报内容", () => run({kind:"topic",id:report.topic_id || report.target,offset:0}))); reports.append(item);
     }
     renderTopics();
     if (selected && !$f("forum-search").value.trim()) renderDetail();
@@ -166,6 +171,7 @@
     return paragraph;
   }
   function contentView(topic) {
+    const locked = topic.locked || Boolean(topic.reply_to && snapshot.topics.find(t => t.id === topic.reply_to)?.locked);
     const article = node("article", undefined, "forum-post");
     article.append(node("h3", topic.title || "回复"));
     article.append(node("p", `创建者 ${topic.author.slice(-8)} · ${topic.id.slice(0, 12)}`, "subtle"));
@@ -216,7 +222,7 @@
       });
       comparison.append(columns); article.append(comparison);
     }
-    if (topic.locked) article.append(node("p", "管理员已锁定此主题；未确认的并发变更保留为争议。", "forum-conflict"));
+    if (locked) article.append(node("p", "管理员已锁定此主题；未确认的并发变更保留为争议。", "forum-conflict"));
     else article.append(button(topic.heads.length > 1 ? "编辑并确认合并" : "署名编辑", () => openEditor(topic)));
     article.append(button("举报", () => { const reason = prompt("举报原因（将作为署名记录保存，管理员可处理）"); if(reason?.trim()) run({kind:"report",target:topic.id,reason:reason.trim()}); }));
     return article;
