@@ -1,6 +1,7 @@
 //! Independent forum worker. All mutable state and disk writes have one owner.
 use super::*;
 mod assets;
+mod discovery;
 pub use assets::AttachmentInput;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures::StreamExt;
@@ -38,6 +39,14 @@ pub struct DraftData {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ForumRequest {
     State,
+    Page {
+        offset: usize,
+    },
+    Topic {
+        id: String,
+        #[serde(default)]
+        offset: usize,
+    },
     Draft {
         #[serde(flatten)]
         draft: DraftData,
@@ -193,6 +202,7 @@ struct Saved {
     forum: Forum,
     cached: BTreeMap<Digest, assets::Cached>,
     draft: DraftData,
+    entries: Vec<NodeAddress>,
 }
 #[derive(Serialize, Deserialize)]
 struct Invitation {
@@ -231,6 +241,16 @@ struct Worker {
     credit: f64,
     credit_at: Instant,
     delayed: HashMap<PeerId, Instant>,
+    page_offset: usize,
+    focused_topic: Option<Digest>,
+    reply_offset: usize,
+    shown_bodies: BTreeSet<Digest>,
+    addresses: BTreeMap<PeerId, NodeAddress>,
+    candidates: VecDeque<NodeAddress>,
+    seen_queries: HashMap<[u8; 16], Instant>,
+    providers: BTreeMap<Digest, (Instant, Vec<NodeAddress>)>,
+    last_find: Instant,
+    wanted: BTreeMap<Digest, Instant>,
 }
 
 impl Drop for Worker {
@@ -314,6 +334,7 @@ impl Worker {
                 forum: super::storage::validate_snapshot(value.forum)?,
                 cached: value.cached,
                 draft: value.draft,
+                entries: value.entries,
             })
         } else {
             None
@@ -341,6 +362,16 @@ impl Worker {
             credit: 500_000.0,
             credit_at: Instant::now(),
             delayed: HashMap::new(),
+            page_offset: 0,
+            focused_topic: None,
+            reply_offset: 0,
+            shown_bodies: BTreeSet::new(),
+            addresses: BTreeMap::new(),
+            candidates: VecDeque::new(),
+            seen_queries: HashMap::new(),
+            providers: BTreeMap::new(),
+            last_find: Instant::now(),
+            wanted: BTreeMap::new(),
         })
     }
     fn refresh(&mut self) {
@@ -394,8 +425,48 @@ impl Worker {
     fn state(&self) -> Value {
         let own = self.key.public().encode_protobuf();
         let mut topics = vec![];
+        let total = self
+            .view
+            .topics
+            .iter()
+            .filter(|t| t.reply_to.is_none())
+            .count();
+        let reply_total = self
+            .focused_topic
+            .map(|root| {
+                self.view
+                    .topics
+                    .iter()
+                    .filter(|t| t.reply_to == Some(root))
+                    .count()
+            })
+            .unwrap_or(0);
+        let selected: Vec<_> = if let Some(root) = self.focused_topic {
+            self.view
+                .topics
+                .iter()
+                .filter(|t| t.root == root)
+                .chain(
+                    self.view
+                        .topics
+                        .iter()
+                        .filter(|t| t.reply_to == Some(root))
+                        .skip(self.reply_offset)
+                        .take(20),
+                )
+                .collect()
+        } else {
+            self.view
+                .topics
+                .iter()
+                .filter(|t| t.reply_to.is_none())
+                .skip(self.page_offset)
+                .take(20)
+                .collect()
+        };
+        let mut body_budget = 1_600_000usize;
         if let Some(s) = &self.saved {
-            for topic in self.view.topics.iter().take(100) {
+            for topic in selected {
                 let root = &s.forum.records[&topic.root];
                 let mut versions = vec![];
                 for (id, r) in &s.forum.records {
@@ -412,7 +483,7 @@ impl Worker {
                         if target.unwrap_or(*id) != topic.root {
                             continue;
                         }
-                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":if topic.heads.contains(id){s.forum.body(body).and_then(|b|std::str::from_utf8(b).ok())}else{None},"body_hash":hex(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash)})).collect::<Vec<_>>()}));
+                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":if topic.heads.contains(id)||self.shown_bodies.contains(body){s.forum.body(body).filter(|b|{if b.len()<=body_budget{body_budget-=b.len();true}else{false}}).and_then(|b|std::str::from_utf8(b).ok())}else{None},"body_hash":hex(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash)})).collect::<Vec<_>>()}));
                     }
                 }
                 let title = topic
@@ -426,10 +497,10 @@ impl Worker {
                             None
                         }
                     });
-                topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions}));
+                topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body(&topic.root).ok().flatten()}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":self.view.topics.len(),"truncated":self.view.topics.len()>100,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now()})).collect::<Vec<_>>(),"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now()})).collect::<Vec<_>>(),"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
     }
     fn apply_governance(&mut self, records: Vec<SignedRecord>) -> Result<()> {
         ensure!(records.len() <= 256, "治理记录过多");
@@ -502,6 +573,44 @@ impl Worker {
         let mut attachment = None;
         match request {
             ForumRequest::State => {}
+            ForumRequest::Page { offset } => {
+                ensure!(
+                    offset
+                        <= self
+                            .view
+                            .topics
+                            .iter()
+                            .filter(|t| t.reply_to.is_none())
+                            .count(),
+                    "页面范围无效"
+                );
+                self.page_offset = offset;
+                self.focused_topic = None;
+                self.shown_bodies.clear();
+            }
+            ForumRequest::Topic { id, offset } => {
+                let root = parse_hash(&id)?;
+                ensure!(
+                    self.view
+                        .topics
+                        .iter()
+                        .any(|t| t.root == root && t.reply_to.is_none()),
+                    "主题不存在"
+                );
+                ensure!(
+                    offset
+                        <= self
+                            .view
+                            .topics
+                            .iter()
+                            .filter(|t| t.reply_to == Some(root))
+                            .count(),
+                    "回复页面范围无效"
+                );
+                self.focused_topic = Some(root);
+                self.reply_offset = offset;
+                self.shown_bodies.clear();
+            }
             ForumRequest::Draft { draft } => {
                 ensure!(
                     draft.title.chars().count() <= 100
@@ -553,6 +662,7 @@ impl Worker {
                     forum: Forum::new(network, self.key.public().encode_protobuf())?,
                     cached: BTreeMap::new(),
                     draft: DraftData::default(),
+                    entries: vec![],
                 });
                 self.refresh();
             }
@@ -582,6 +692,7 @@ impl Worker {
                     forum,
                     cached: BTreeMap::new(),
                     draft: DraftData::default(),
+                    entries: vec![],
                 });
                 self.refresh();
             }
@@ -604,6 +715,11 @@ impl Worker {
                     "不是当前论坛的连接码"
                 );
                 ensure!(e.addresses.len() <= 8, "连接地址过多");
+                let node = NodeAddress {
+                    peer: e.peer.clone(),
+                    addresses: e.addresses.clone(),
+                };
+                self.remember(node)?;
                 let peer: PeerId = e.peer.parse()?;
                 ensure!(self.peers.len() < 8, "论坛邻居已达上限");
                 for addr in e.addresses {
@@ -724,6 +840,11 @@ impl Worker {
             }
             ForumRequest::Fetch { hash } => {
                 let hash = parse_hash(&hash)?;
+                if self.shown_bodies.len() >= 16 {
+                    self.shown_bodies.clear();
+                }
+                self.shown_bodies.insert(hash);
+                self.begin_find(hash);
                 if self.attachment_size(&hash).is_some() {
                     self.start_download(hash)?;
                 } else {
@@ -742,6 +863,10 @@ impl Worker {
                     );
                 }
             }
+        }
+        if self.saved.is_some() && !self.listening {
+            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+            self.listening = true;
         }
         self.persist()?;
         if code.is_none() && self.listening && !self.listen.is_empty() {
@@ -815,6 +940,24 @@ impl Worker {
         ensure!(self.allowed(&peer), "成员资格无效");
         let s = self.saved.as_ref().unwrap();
         Ok(match request.query {
+            Query::Neighbors => {
+                let mut nodes: Vec<_> = self
+                    .addresses
+                    .iter()
+                    .filter(|(id, _)| **id != peer && self.allowed(id))
+                    .map(|(_, n)| n.clone())
+                    .take(2)
+                    .collect();
+                if let Some(node) = self.own_address() {
+                    nodes.insert(0, node);
+                }
+                Response::Neighbors { nodes }
+            }
+            Query::Find {
+                hash,
+                request_id,
+                hops,
+            } => self.find_answer(peer, hash, request_id, hops)?,
             Query::Chunk { hash, offset } => {
                 let total = self
                     .attachment_size(&hash)
@@ -887,6 +1030,37 @@ impl Worker {
             anyhow::bail!("对方拒绝论坛访问，请检查批准及撤销状态");
         }
         match (pending.query, response) {
+            (Query::Neighbors, Response::Neighbors { nodes }) => {
+                ensure!(self.allowed(&peer) && nodes.len() <= 3, "邻居列表无效");
+                for node in nodes {
+                    self.remember(node.clone())?;
+                    if self.candidates.len() < 16 {
+                        self.candidates.push_back(node);
+                    }
+                }
+            }
+            (
+                Query::Find { hash, .. },
+                Response::Found {
+                    hash: received,
+                    nodes,
+                },
+            ) => {
+                ensure!(
+                    self.allowed(&peer) && hash == received && nodes.len() <= 3,
+                    "副本查询响应无效"
+                );
+                for node in &nodes {
+                    self.remember(node.clone())?;
+                    if self.candidates.len() < 16 {
+                        self.candidates.push_back(node.clone());
+                    }
+                }
+                if self.providers.len() < 256 {
+                    self.providers.insert(hash, (Instant::now(), nodes));
+                }
+                self.fetch_wanted(peer);
+            }
             (
                 Query::Chunk { hash, offset },
                 Response::Chunk {
@@ -907,7 +1081,9 @@ impl Worker {
                 ensure!(self.allowed(&peer), "对方不是有效成员");
                 self.authenticating.remove(&peer);
                 self.peers.insert(peer);
+                self.enqueue(peer, Query::Neighbors);
                 self.enqueue(peer, Query::Inventory { after: None });
+                self.fetch_wanted(peer);
             }
             (Query::Inventory { after }, Response::Inventory { ids, more }) => {
                 ensure!(
@@ -971,6 +1147,7 @@ impl Worker {
                     self.saved.as_mut().unwrap().forum.put_body(bytes)?;
                     self.dirty = true;
                     self.status = "正文已校验并缓存".into();
+                    self.wanted.remove(&hash);
                 }
             }
             _ => anyhow::bail!("响应类型不匹配"),
@@ -978,6 +1155,17 @@ impl Worker {
         Ok(())
     }
     async fn run(mut self, mut swarm: super::wire::Swarm, rx: mpsc::Receiver<Command>) {
+        if let Some(saved) = &self.saved {
+            self.candidates.extend(saved.entries.clone());
+        }
+        if self.saved.is_some() {
+            if swarm
+                .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+                .is_ok()
+            {
+                self.listening = true;
+            }
+        }
         let mut ticks = tokio::time::interval(Duration::from_millis(50));
         let mut last_sync = Instant::now();
         let mut last_save = Instant::now();
@@ -993,6 +1181,7 @@ impl Worker {
                     let expired:Vec<_>=self.authenticating.iter().filter(|(_,t)|t.elapsed()>Duration::from_secs(5)).map(|(p,_)|*p).chain(self.peers.iter().filter(|p|!self.allowed(p)).copied()).collect();
                     for peer in expired {let _=swarm.disconnect_peer_id(peer);self.authenticating.remove(&peer);self.peers.remove(&peer);self.queues.remove(&peer);}
                     self.downloads.retain(|_,d|d.updated.elapsed()<Duration::from_secs(30));
+                    self.discovery_tick(&mut swarm);
                     self.next(&mut swarm);
                 }
                 event=swarm.select_next_some()=>match event{
@@ -1175,6 +1364,7 @@ mod tests {
             forum,
             cached: BTreeMap::new(),
             draft: DraftData::default(),
+            entries: vec![],
         });
         w.refresh();
         let peer = w.key.public().to_peer_id();
@@ -1214,6 +1404,7 @@ mod tests {
             forum: Forum::new([7; 32], w.key.public().encode_protobuf()).unwrap(),
             cached: BTreeMap::new(),
             draft: DraftData::default(),
+            entries: vec![],
         });
         w.refresh();
         let stranger = Keypair::ed25519_from_bytes([2; 32])

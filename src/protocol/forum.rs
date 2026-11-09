@@ -75,14 +75,38 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Query {
-    Chunk { hash: Digest, offset: u64 },
-    Hello { governance: Vec<SignedRecord> },
-    Inventory { after: Option<Digest> },
-    Records { ids: Vec<Digest> },
-    Body { hash: Digest },
+    Neighbors,
+    Find {
+        hash: Digest,
+        request_id: [u8; 16],
+        hops: u8,
+    },
+    Chunk {
+        hash: Digest,
+        offset: u64,
+    },
+    Hello {
+        governance: Vec<SignedRecord>,
+    },
+    Inventory {
+        after: Option<Digest>,
+    },
+    Records {
+        ids: Vec<Digest>,
+    },
+    Body {
+        hash: Digest,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
+    Neighbors {
+        nodes: Vec<NodeAddress>,
+    },
+    Found {
+        hash: Digest,
+        nodes: Vec<NodeAddress>,
+    },
     Busy,
     Chunk {
         hash: Digest,
@@ -105,4 +129,10 @@ pub enum Response {
         hash: Digest,
         bytes: Option<Vec<u8>>,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeAddress {
+    pub peer: String,
+    pub addresses: Vec<String>,
 }

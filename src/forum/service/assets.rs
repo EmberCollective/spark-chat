@@ -305,6 +305,7 @@ impl Worker {
                 "附件哈希不匹配，请换副本重试"
             );
             self.finish_blob(hash, d.size, false, d.temporary)?;
+            self.wanted.remove(&hash);
             self.status = "附件已校验并缓存，可以保存".into();
         } else {
             let offset = d.received;
