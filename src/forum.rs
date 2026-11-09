@@ -388,7 +388,14 @@ impl Forum {
                     inviter,
                     expires_at,
                 } => {
+                    // The first inviter is immutable: renewal/re-admission may extend
+                    // access but cannot rewrite provenance or point back to a descendant.
                     if !view.members.get(inviter).is_some_and(|m| !m.revoked)
+                        || member == inviter
+                        || view
+                            .members
+                            .get(member)
+                            .is_some_and(|m| &m.inviter != inviter)
                         || member == &self.admin
                     {
                         false

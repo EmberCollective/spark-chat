@@ -430,3 +430,53 @@ fn report_and_category_permissions_reject_forgery_and_unknown_targets() {
     )
     .is_err());
 }
+
+#[test]
+fn admission_renewal_preserves_first_inviter_and_prevents_cycles() {
+    let mut f = fixture();
+    let child = gov(
+        &f,
+        GovernanceChange::Admit {
+            member: pk(7),
+            inviter: pk(2),
+            expires_at: 1000,
+        },
+    );
+    f.ingest(child).unwrap();
+    let renew = gov(
+        &f,
+        GovernanceChange::Admit {
+            member: pk(7),
+            inviter: pk(2),
+            expires_at: 2000,
+        },
+    );
+    f.ingest(renew).unwrap();
+    assert_eq!(f.rebuild().members[&pk(7)].inviter, pk(2));
+    assert_eq!(f.rebuild().members[&pk(7)].expires_at, 2000);
+    let valid_sequence = f.rebuild().governance_sequence;
+    let mut cycle = f.clone();
+    let rewrite = gov(
+        &cycle,
+        GovernanceChange::Admit {
+            member: pk(2),
+            inviter: pk(7),
+            expires_at: 3000,
+        },
+    );
+    let id = cycle.ingest(rewrite).unwrap();
+    assert_eq!(cycle.rebuild().governance_sequence, valid_sequence);
+    assert!(cycle.rebuild().pending.contains(&id));
+    assert_eq!(cycle.rebuild().members[&pk(2)].inviter, pk(1));
+    let self_invite = gov(
+        &f,
+        GovernanceChange::Admit {
+            member: pk(8),
+            inviter: pk(8),
+            expires_at: 3000,
+        },
+    );
+    let id = f.ingest(self_invite).unwrap();
+    assert!(f.rebuild().pending.contains(&id));
+    assert!(!f.rebuild().members.contains_key(&pk(8)));
+}
