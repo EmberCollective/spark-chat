@@ -93,6 +93,8 @@
       $("forum-open").click();await tick();
       check(!$("forum-panel").hidden&&$("workspace").hidden,"论坛独立入口");
       check(!document.querySelector("#forum-topics img"),"论坛标题不能注入HTML");
+      check($("forum-network").textContent==="已连接 2 节点"&&!$("forum-network").textContent.includes("待补齐")&&$("forum-network-detail").textContent.includes("待补齐"),"顶栏精简连接状态且完整同步信息保留在网络页");
+      check([...$("forum-side-categories").querySelectorAll("button")].every(b=>!b.classList.contains("secondary")),"侧栏版块沿用透明导航而非表单按钮");
       const visibleViews=()=>[...document.querySelectorAll('[id^="forum-view-"]')].filter(el=>!el.hidden);
       check(visibleViews().length===1&&visibleViews()[0].id==="forum-view-home","论坛默认只显示独立主题首页");
       document.querySelector('[data-forum-page="network"]').click();
