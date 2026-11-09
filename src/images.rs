@@ -343,6 +343,30 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_preview_preserves_normalized_bytes_across_reads_and_restart() {
+        let pixels = image::RgbImage::from_fn(32, 24, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 4) as u8])
+        });
+        let mut source = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut source, ImageFormat::Jpeg)
+            .unwrap();
+        let expected = validate_and_normalize(source.get_ref()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path(), [7; 32]).unwrap();
+        let id = cache.put(source.get_ref()).unwrap();
+        for _ in 0..4 {
+            let preview = cache.get(&id).unwrap();
+            assert_eq!(preview.mime, "image/jpeg");
+            assert_eq!((preview.width, preview.height), (32, 24));
+            assert_eq!(preview.bytes, expected.bytes);
+        }
+        drop(cache);
+        let reopened = ImageCache::new(dir.path(), [7; 32]).unwrap();
+        assert_eq!(reopened.get(&id).unwrap().bytes, expected.bytes);
+    }
+
+    #[test]
     fn encrypted_index_roundtrip_and_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ImageCache::new(dir.path(), [7; 32]).unwrap();
