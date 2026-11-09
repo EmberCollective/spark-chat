@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod hub;
 mod merge;
 pub mod service;
 mod storage;
@@ -177,6 +178,15 @@ fn validate(signed: &SignedRecord, network: Digest) -> Result<()> {
                 }
             }
         }
+        Action::Nickname { nickname, sequence } => {
+            ensure!(
+                *sequence > 0
+                    && !nickname.trim().is_empty()
+                    && nickname.chars().count() <= 24
+                    && !nickname.chars().any(char::is_control),
+                "昵称须为1至24字且不含控制字符"
+            );
+        }
         Action::Report { reason, .. } => {
             ensure!(
                 !reason.trim().is_empty() && reason.chars().count() <= 500,
@@ -218,6 +228,7 @@ pub struct ForumView {
     pub topics: Vec<Topic>,
     pub categories: BTreeMap<String, String>,
     pub reports: Vec<Report>,
+    pub nicknames: BTreeMap<Vec<u8>, String>,
     pub pending: Vec<Digest>,
     pub disputed: Vec<Digest>,
     pub invalid: Vec<Digest>,
@@ -611,8 +622,28 @@ impl Forum {
                 .collect();
             topic.heads.retain(|id| !consumed.contains(id));
         }
+        let mut profiles = BTreeMap::new();
         for (id, signed) in &self.records {
             match signed.record.action {
+                Action::Nickname {
+                    ref nickname,
+                    sequence,
+                } => {
+                    if !view.members.contains_key(&signed.record.author) {
+                        view.pending.push(*id);
+                    } else if view.members[&signed.record.author].revoked
+                        || view.members[&signed.record.author].expires_at <= now
+                        || view.governance_conflict
+                    {
+                        disputed.insert(*id);
+                    } else {
+                        let key = signed.record.author.clone();
+                        let candidate = (sequence, *id, nickname.clone());
+                        if profiles.get(&key).is_none_or(|old| &candidate > old) {
+                            profiles.insert(key, candidate);
+                        }
+                    }
+                }
                 Action::Report { target, ref reason } => {
                     if !valid.contains_key(&target)
                         || !view.members.contains_key(&signed.record.author)
@@ -637,6 +668,10 @@ impl Forum {
                 _ => {}
             }
         }
+        view.nicknames = profiles
+            .into_iter()
+            .map(|(key, (_, _, name))| (key, name))
+            .collect();
         view.pending.sort();
         view.pending.dedup();
         view.disputed = disputed.into_iter().collect();
@@ -720,6 +755,7 @@ impl Forum {
 
 fn dependencies(action: &Action) -> Vec<Digest> {
     match action {
+        Action::Nickname { .. } => vec![],
         Action::Report { target, .. } => vec![*target],
         Action::Content {
             target,

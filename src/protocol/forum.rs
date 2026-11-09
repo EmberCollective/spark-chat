@@ -68,6 +68,10 @@ pub enum Action {
         target: Digest,
         reason: String,
     },
+    Nickname {
+        nickname: String,
+        sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

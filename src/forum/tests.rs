@@ -525,3 +525,46 @@ fn automatic_merge_excludes_expired_unconfirmed_branches() {
     assert!(f.merged_body_at(&root, 1000).unwrap().is_none());
     assert_eq!(f.rebuild_at(1000).topics[0].heads.len(), 1);
 }
+
+#[test]
+fn nicknames_are_self_signed_and_reordered_updates_converge() {
+    let mut f = fixture();
+    let first = sign_record(
+        &key(2),
+        f.network(),
+        Action::Nickname {
+            nickname: "昵称一".into(),
+            sequence: 1,
+        },
+    )
+    .unwrap();
+    let second = sign_record(
+        &key(2),
+        f.network(),
+        Action::Nickname {
+            nickname: "昵称二".into(),
+            sequence: 2,
+        },
+    )
+    .unwrap();
+    let mut forged = second.clone();
+    forged.record.author = pk(3);
+    assert!(f.ingest(forged).is_err());
+    let mut other = f.clone();
+    f.ingest(first.clone()).unwrap();
+    f.ingest(second.clone()).unwrap();
+    other.ingest(second).unwrap();
+    other.ingest(first).unwrap();
+    assert_eq!(f.rebuild_at(1).nicknames, other.rebuild_at(1).nicknames);
+    assert_eq!(f.rebuild_at(1).nicknames[&pk(2)], "昵称二");
+    assert!(f.rebuild_at(1001).nicknames.is_empty());
+    assert!(sign_record(
+        &key(2),
+        f.network(),
+        Action::Nickname {
+            nickname: "\n".into(),
+            sequence: 3
+        }
+    )
+    .is_err());
+}

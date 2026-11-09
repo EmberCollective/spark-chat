@@ -22,7 +22,7 @@ struct RevisionedEvent<'a> {
 }
 
 type Backend = Arc<Mutex<App>>;
-type ForumBackend = Arc<Mutex<Option<crate::forum::service::ForumService>>>;
+type ForumBackend = Arc<Mutex<Option<crate::forum::hub::ForumHub>>>;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -63,13 +63,17 @@ enum Request {
     Forum {
         command: Value,
     },
-    ForumAttach,
+    ForumAttach {
+        community_id: String,
+    },
     ForumSave {
+        community_id: String,
         hash: String,
         name: String,
         size: u64,
     },
     ForumPreview {
+        community_id: String,
         hash: String,
     },
     PickKeyfile {
@@ -92,10 +96,23 @@ enum Request {
     },
 }
 
+fn ensure_community(forum: &Option<crate::forum::hub::ForumHub>, id: &str) -> Result<(), String> {
+    if forum.as_ref().ok_or("论坛尚未启动")?.current_id() != id {
+        return Err("社区已切换，请重新操作".into());
+    }
+    Ok(())
+}
+
 fn validated_link(value: &str) -> Result<tauri::Url, String> {
-    if value.len() > 4096 || value.chars().any(char::is_control) { return Err("链接格式无效".into()); }
+    if value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err("链接格式无效".into());
+    }
     let url = tauri::Url::parse(value).map_err(|_| "链接格式无效")?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err("仅支持不含登录凭据的 HTTP/HTTPS 链接".into());
     }
     Ok(url)
@@ -121,7 +138,7 @@ async fn dispatch(
                 let mut storage_key = [0u8; 32];
                 hkdf::Hkdf::<sha2::Sha256>::new(None, &seed)
                     .expand(b"SparkNet/forum/local-storage/v1", &mut storage_key).map_err(|_| "无法初始化论坛存储")?;
-                let started = crate::forum::service::ForumService::start(seed, storage_key, directory.join("forum"));
+                let started = crate::forum::hub::ForumHub::start(seed, storage_key, directory.join("forum"));
                 seed.zeroize();
                 storage_key.zeroize();
                 *forum = Some(started.map_err(|e| e.to_string())?);
@@ -130,6 +147,10 @@ async fn dispatch(
             drop(app);
             let object = command.as_object_mut().ok_or("论坛操作无效")?;
             if let Some(kind) = object.remove("kind") { object.insert("action".into(), kind); }
+            let expected = object.remove("community_id");
+            let expected = match &expected { Some(value) => Some(value.as_str().ok_or("社区标识格式无效")?), None => None };
+            let unscoped = matches!(object.get("action").and_then(Value::as_str), Some("state" | "community_list"));
+            forum.as_ref().ok_or("论坛尚未启动")?.check_scope(expected, unscoped).map_err(|e|e.to_string())?;
             let command = serde_json::from_value(command).map_err(|_| "论坛操作格式无效")?;
             return forum.as_ref().ok_or("论坛尚未启动")?.handle(command).map_err(|e| e.to_string());
         }
@@ -147,11 +168,12 @@ async fn dispatch(
         #[cfg(not(target_os = "android"))]
         let _ = handle;
         match request {
-            Request::ForumPreview { ref hash } => {
+            Request::ForumPreview { ref hash, ref community_id } => {
                 use base64::Engine;
                 let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
                 app.forum_material()?;
                 let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+                ensure_community(&forum, community_id)?;
                 drop(app);
                 let result = forum.as_ref().ok_or("论坛尚未启动")?.read_preview(hash.clone()).map_err(|e| e.to_string())?;
                 let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(result["bytes"].as_str().ok_or("预览数据无效")?).map_err(|_| "预览数据无效")?;
@@ -159,24 +181,28 @@ async fn dispatch(
                 return Ok(json!({"mime":image.mime,"data":base64::engine::general_purpose::STANDARD.encode(image.bytes)}));
             }
             #[cfg(not(target_os = "android"))]
-            Request::ForumAttach => {
+            Request::ForumAttach { ref community_id } => {
+                ensure_community(&*forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?, community_id)?;
                 let Some(path) = rfd::FileDialog::new().pick_file() else { return Ok(Value::Null); };
                 let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
                 app.forum_material()?;
                 let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+                ensure_community(&forum, community_id)?;
                 drop(app);
                 let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
                 let name = path.file_name().and_then(|s|s.to_str()).unwrap_or("附件").to_owned();
                 return forum.as_ref().ok_or("请先加入论坛")?.attach(name,file).map_err(|e|e.to_string());
             }
             #[cfg(not(target_os = "android"))]
-            Request::ForumSave { ref hash, ref name, size } => {
+            Request::ForumSave { ref hash, ref name, size, ref community_id } => {
                 if size > 20_000_000 { return Err("附件超过大小限制".into()); }
                 let name = std::path::Path::new(name).file_name().and_then(|s|s.to_str()).unwrap_or("附件");
+                ensure_community(&*forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?, community_id)?;
                 let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() else { return Ok(Value::Null); };
                 let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
                 app.forum_material()?;
                 let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+                ensure_community(&forum, community_id)?;
                 drop(app);
                 let target = crate::transfer::ReceiveTarget::path(&path,size).map_err(|e|e.to_string())?;
                 forum.as_ref().ok_or("请先加入论坛")?.export(hash.clone(),target.file.try_clone().map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
@@ -446,7 +472,14 @@ pub fn run() -> anyhow::Result<()> {
 mod link_tests {
     #[test]
     fn external_links_only_allow_web_addresses() {
-        for bad in ["file:///etc/passwd", "javascript:alert(1)", "https://user:secret@example.com", "https://example.com/\n"] { assert!(super::validated_link(bad).is_err()); }
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://user:secret@example.com",
+            "https://example.com/\n",
+        ] {
+            assert!(super::validated_link(bad).is_err());
+        }
         assert!(super::validated_link("https://example.com/路径?a=1").is_ok());
     }
 }

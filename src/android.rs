@@ -110,7 +110,11 @@ pub fn dispatch(
                 .map_err(|e| format!("无法打开链接：{e}"))?;
             Ok(Value::Null)
         })()),
-        Request::ForumAttach => Some((|| {
+        Request::ForumAttach { community_id } => Some((|| {
+            super::ensure_community(
+                &*forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?,
+                community_id,
+            )?;
             let _task = FileTask::begin(handle)?;
             let Some(path) = handle.dialog().file().blocking_pick_file() else {
                 return Ok(Value::Null);
@@ -126,6 +130,7 @@ pub fn dispatch(
             let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
             app.forum_material()?;
             let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+            super::ensure_community(&forum, community_id)?;
             drop(app);
             forum
                 .as_ref()
@@ -159,7 +164,16 @@ pub fn dispatch(
             target.commit().map_err(|e| e.to_string())?;
             Ok(json!(path.to_string()))
         })()),
-        Request::ForumSave { hash, name, size } => Some((|| {
+        Request::ForumSave {
+            hash,
+            name,
+            size,
+            community_id,
+        } => Some((|| {
+            super::ensure_community(
+                &*forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?,
+                community_id,
+            )?;
             let _task = FileTask::begin(handle)?;
             if *size > 20_000_000 {
                 return Err("附件超过大小限制".into());
@@ -179,6 +193,7 @@ pub fn dispatch(
             let app = backend.lock().map_err(|_| "聊天服务暂时不可用")?;
             app.forum_material()?;
             let forum = forum_backend.lock().map_err(|_| "论坛服务暂时不可用")?;
+            super::ensure_community(&forum, community_id)?;
             let bytes = zeroize::Zeroizing::new(
                 forum
                     .as_ref()

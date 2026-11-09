@@ -41,6 +41,13 @@ pub struct DraftData {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ForumRequest {
     State,
+    CommunityList,
+    CommunitySelect {
+        id: String,
+    },
+    Nickname {
+        nickname: String,
+    },
     Search {
         query: String,
         #[serde(default)]
@@ -577,7 +584,7 @@ impl Worker {
                 topics.push(json!({"id":hex(&topic.root),"title":title,"author":URL_SAFE_NO_PAD.encode(&root.record.author),"reply_to":topic.reply_to.map(|h|hex(&h)),"hidden":topic.hidden,"locked":topic.locked,"category":topic.category,"heads":topic.heads.iter().map(hex).collect::<Vec<_>>(),"versions":versions,"merged_body":s.forum.merged_body_at(&topic.root,now()).ok().flatten()}));
             }
         }
-        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"downloads":self.downloads.values().map(|d|json!({"hash":hex(&d.hash),"size":d.size,"received":d.received})).collect::<Vec<_>>(),"categories":self.view.categories,"reports":if self.saved.as_ref().is_some_and(|s|s.forum.admin==self.key.public().encode_protobuf()){self.view.reports.iter().map(|r|json!({"id":hex(&r.id),"target":hex(&r.target),"topic_id":self.report_topic(r.target).map(|h|hex(&h)),"author":URL_SAFE_NO_PAD.encode(&r.author),"reason":r.reason})).collect::<Vec<_>>()}else{vec![]},"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+        json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"downloads":self.downloads.values().map(|d|json!({"hash":hex(&d.hash),"size":d.size,"received":d.received})).collect::<Vec<_>>(),"nickname":self.view.nicknames.get(&self.key.public().encode_protobuf()),"nicknames":self.view.nicknames.iter().map(|(key,name)|(URL_SAFE_NO_PAD.encode(key),name)).collect::<BTreeMap<_,_>>(),"categories":self.view.categories,"reports":if self.saved.as_ref().is_some_and(|s|s.forum.admin==self.key.public().encode_protobuf()){self.view.reports.iter().map(|r|json!({"id":hex(&r.id),"target":hex(&r.target),"topic_id":self.report_topic(r.target).map(|h|hex(&h)),"author":URL_SAFE_NO_PAD.encode(&r.author),"reason":r.reason})).collect::<Vec<_>>()}else{vec![]},"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
     }
     fn report_topic(&self, id: Digest) -> Option<Digest> {
         let forum = &self.saved.as_ref()?.forum;
@@ -711,6 +718,44 @@ impl Worker {
         let mut attachment = None;
         match request {
             ForumRequest::State => {}
+            ForumRequest::CommunityList | ForumRequest::CommunitySelect { .. } => {
+                anyhow::bail!("社区操作须由社区管理器执行")
+            }
+            ForumRequest::Nickname { nickname } => {
+                let saved = self
+                    .saved
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("请先加入社区"))?;
+                let author = self.key.public().encode_protobuf();
+                ensure!(saved.forum.can_access(&author, now()), "成员资格已失效");
+                let sequence = saved
+                    .forum
+                    .records
+                    .values()
+                    .filter(|r| r.record.author == author)
+                    .filter_map(|r| {
+                        if let Action::Nickname { sequence, .. } = r.record.action {
+                            Some(sequence)
+                        } else {
+                            None
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("昵称版本容量已满"))?;
+                let record = sign_record(
+                    &self.key,
+                    saved.forum.network,
+                    Action::Nickname {
+                        nickname: nickname.trim().into(),
+                        sequence,
+                    },
+                )?;
+                let mut candidate = saved.forum.clone();
+                candidate.ingest(record)?;
+                self.commit_forum(candidate)?;
+            }
             ForumRequest::Search { query, offset } => {
                 let search = self.search(&query, offset)?;
                 return Ok(json!({"state":self.state(),"search":search}));
@@ -1544,6 +1589,13 @@ mod tests {
         b.handle(ForumRequest::Connect { code: connection })
             .unwrap();
         wait(|| state(&a)["peers"].as_u64().unwrap() > 0);
+        a.handle(ForumRequest::Nickname {
+            nickname: "山间来信".into(),
+        })
+        .unwrap();
+        let author = state(&a)["own_public"].as_str().unwrap().to_owned();
+        b.handle(ForumRequest::Sync).unwrap();
+        wait(|| state(&b)["nicknames"][&author] == "山间来信");
         a.handle(ForumRequest::Publish {
             target: None,
             reply_to: None,
@@ -1704,7 +1756,11 @@ mod tests {
         assert!(!w.allowed(&member.to_peer_id()));
         let stored = std::fs::read(&w.path).unwrap();
         w.apply_governance(vec![revoke]).unwrap();
-        assert_eq!(std::fs::read(&w.path).unwrap(), stored, "duplicate sync must not rewrite encrypted snapshot");
+        assert_eq!(
+            std::fs::read(&w.path).unwrap(),
+            stored,
+            "duplicate sync must not rewrite encrypted snapshot"
+        );
     }
     #[test]
     fn pending_records_are_not_advertised_or_exported() {
