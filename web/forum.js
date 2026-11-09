@@ -81,6 +81,15 @@
     $f("forum-network").textContent = data.joined
       ? `${data.peers || 0} 个连接 · ${data.pending || 0} 条记录待补齐 · ${data.disputed || 0} 条争议记录`
       : "先创建论坛，或导入管理员提供的入网材料。";
+    const filter = $f("forum-category-filter"), selectedCategory = filter.value;
+    filter.replaceChildren(); const all = node("option", "全部版块"); all.value = ""; filter.append(all);
+    for (const [id,title] of Object.entries(data.categories || {})) { const option = node("option",title); option.value=id;filter.append(option); }
+    filter.value = selectedCategory;
+    const reports = $f("forum-reports"); reports.replaceChildren();
+    for (const report of data.reports || []) {
+      const item = node("div"); item.append(node("p", `${report.author.slice(-8)}：${report.reason}`));
+      item.append(button("查看被举报内容", () => run({kind:"topic",id:report.target,offset:0}))); reports.append(item);
+    }
     renderTopics();
     if (selected && !$f("forum-search").value.trim()) renderDetail();
     const members = $f("forum-members");
@@ -115,10 +124,12 @@
       return;
     }
     const topics = (snapshot?.topics || []).filter(t => !t.reply_to && (!t.hidden || snapshot.admin) &&
+      (!$f("forum-category-filter").value || t.category === $f("forum-category-filter").value) &&
       (!query || t.title.toLowerCase().includes(query) || t.versions.some(v => v.body?.toLowerCase().includes(query))));
     for (const topic of topics) {
       const row = node("button", undefined, "forum-topic");
       row.type = "button";
+      row.append(node("span", snapshot.categories?.[topic.category] || "综合", "subtle"));
       row.append(node("strong", `${topic.hidden ? "[已隐藏] " : ""}${topic.title || "未命名主题"}`));
       row.append(node("span", `${topic.author.slice(-8)} · ${topic.heads.length > 1 ? `${topic.heads.length} 个并发版本` : "签名已验证"}`, "subtle"));
       row.addEventListener("click", async () => {
@@ -205,7 +216,9 @@
       });
       comparison.append(columns); article.append(comparison);
     }
-    article.append(button(topic.heads.length > 1 ? "编辑并确认合并" : "署名编辑", () => openEditor(topic)));
+    if (topic.locked) article.append(node("p", "管理员已锁定此主题；未确认的并发变更保留为争议。", "forum-conflict"));
+    else article.append(button(topic.heads.length > 1 ? "编辑并确认合并" : "署名编辑", () => openEditor(topic)));
+    article.append(button("举报", () => { const reason = prompt("举报原因（将作为署名记录保存，管理员可处理）"); if(reason?.trim()) run({kind:"report",target:topic.id,reason:reason.trim()}); }));
     return article;
   }
   function renderDetail() {
@@ -224,8 +237,17 @@
     }
     for (const reply of snapshot.topics.filter(t => t.reply_to === selected && !t.hidden)) detail.append(contentView(reply));
     paginate(detail, snapshot.reply_offset || 0, snapshot.reply_total || 0, offset => run({ kind: "topic", id: selected, offset }));
-    detail.append(button("回复", () => openEditor(null, selected)));
-    if (snapshot.admin) detail.append(button("隐藏主题", () => run({ kind: "moderate", target: selected, hidden: true })));
+    if (!topic.locked) {
+      detail.append(button("回复", () => openEditor(null, selected)));
+      detail.append(button("引用回复", () => { openEditor(null, selected); const current=topic.versions.find(v=>topic.heads.includes(v.id)); $f("forum-body").value=(current?.body || "").split("\n").map(line=>"> "+line).join("\n")+"\n\n"; scheduleDraft(); }));
+    }
+    if (snapshot.admin) {
+      detail.append(button("隐藏主题", () => run({ kind: "moderate", target: selected, hidden: true })));
+      detail.append(button(topic.locked ? "解除主题锁定" : "锁定主题", () => run({kind:"lock",target:selected,locked:!topic.locked})));
+      const category = node("select"); category.setAttribute("aria-label", "设置主题版块");
+      for(const [id,title] of Object.entries(snapshot.categories || {})) {const option=node("option",title);option.value=id;category.append(option);}
+      category.value=topic.category || ""; category.addEventListener("change",()=>run({kind:"categorize",target:selected,category:category.value}));detail.append(category);
+    }
   }
   function openEditor(topic = null, replyTo = null) {
     const current = topic?.versions?.find(version => topic.heads.includes(version.id));
@@ -263,6 +285,8 @@
     clearTimeout(searchTimer); searchGeneration++;
     searchTimer = setTimeout(() => search(), 250);
   });
+  $f("forum-category-filter").addEventListener("change", renderTopics);
+  $f("forum-category-save").addEventListener("click", () => run({kind:"category",id:$f("forum-category-id").value.trim(),title:$f("forum-category-title").value.trim()}));
   $f("forum-new").addEventListener("click", () => openEditor());
   $f("forum-cancel").addEventListener("click", () => { editor.hidden = true; });
   function renderAttachments() {
