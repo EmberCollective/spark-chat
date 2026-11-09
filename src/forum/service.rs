@@ -40,6 +40,15 @@ pub struct DraftData {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ForumRequest {
     State,
+    Search {
+        query: String,
+        #[serde(default)]
+        offset: usize,
+    },
+    #[serde(skip)]
+    ReadExport {
+        hash: String,
+    },
     Page {
         offset: usize,
     },
@@ -114,6 +123,7 @@ pub enum ForumRequest {
 struct Command {
     request: ForumRequest,
     reply: mpsc::SyncSender<Result<Value>>,
+    raw: Option<mpsc::SyncSender<Result<Vec<u8>>>>,
 }
 pub struct ForumService {
     tx: Option<mpsc::SyncSender<Command>>,
@@ -128,6 +138,23 @@ impl Drop for ForumService {
     }
 }
 impl ForumService {
+    /// Native-only bounded verified bytes. Caller should zeroize after writing the selected document.
+    pub fn read_export(&self, hash: String) -> Result<Vec<u8>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (reply, _) = mpsc::sync_channel(1);
+        self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("论坛已关闭"))?
+            .try_send(Command {
+                request: ForumRequest::ReadExport { hash },
+                reply,
+                raw: Some(tx),
+            })
+            .map_err(|_| anyhow::anyhow!("论坛操作排队已满或已锁定"))?;
+        rx.recv_timeout(Duration::from_secs(10))
+            .map_err(|_| anyhow::anyhow!("读取附件超时"))?
+    }
+
     pub fn attach(&self, name: String, file: std::fs::File) -> Result<Value> {
         self.handle(ForumRequest::Attach { name, file })
     }
@@ -191,7 +218,11 @@ impl ForumService {
         self.tx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("论坛已关闭"))?
-            .try_send(Command { request, reply: tx })
+            .try_send(Command {
+                request,
+                reply: tx,
+                raw: None,
+            })
             .map_err(|_| anyhow::anyhow!("论坛操作排队已满或已锁定"))?;
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|_| anyhow::anyhow!("论坛操作结果未知，请先刷新状态"))?
@@ -499,13 +530,14 @@ impl Worker {
                         target,
                         body,
                         attachments,
+                        parents,
                         ..
                     } = &r.record.action
                     {
                         if target.unwrap_or(*id) != topic.root {
                             continue;
                         }
-                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":if topic.heads.contains(id)||self.shown_bodies.contains(body){s.forum.body(body).filter(|b|{if b.len()<=body_budget{body_budget-=b.len();true}else{false}}).and_then(|b|std::str::from_utf8(b).ok())}else{None},"body_hash":hex(body),"record_copies":1+self.remote_copies(id),"body_copies":usize::from(s.forum.body(body).is_some())+self.remote_copies(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash),"copies":usize::from(s.cached.contains_key(&a.hash))+self.remote_copies(&a.hash)})).collect::<Vec<_>>()}));
+                        versions.push(json!({"id":hex(id),"author":URL_SAFE_NO_PAD.encode(&r.record.author),"body":if topic.heads.contains(id)||self.shown_bodies.contains(body){s.forum.body(body).filter(|b|{if b.len()<=body_budget{body_budget-=b.len();true}else{false}}).and_then(|b|std::str::from_utf8(b).ok())}else{None},"body_hash":hex(body),"parents":parents.iter().map(hex).collect::<Vec<_>>(),"record_copies":1+self.remote_copies(id),"body_copies":usize::from(s.forum.body(body).is_some())+self.remote_copies(body),"disputed":self.view.disputed.contains(id),"attachments":attachments.iter().map(|a|json!({"name":a.name,"size":a.size,"hash":hex(&a.hash),"ready":s.cached.contains_key(&a.hash),"copies":usize::from(s.cached.contains_key(&a.hash))+self.remote_copies(&a.hash)})).collect::<Vec<_>>()}));
                     }
                 }
                 let title = topic
@@ -523,6 +555,49 @@ impl Worker {
             }
         }
         json!({"joined":self.saved.is_some(),"admin":self.saved.as_ref().is_some_and(|s|s.forum.admin==own),"name":self.saved.as_ref().map(|s|s.name.as_str()).unwrap_or(""),"own_id":self.key.public().to_peer_id().to_string(),"own_public":URL_SAFE_NO_PAD.encode(own),"peers":self.peers.len(),"pending":self.view.pending.len(),"disputed":self.view.disputed.len(),"governance_conflict":self.view.governance_conflict,"topics":topics,"topic_count":total,"total":total,"truncated":if self.focused_topic.is_some(){reply_total>self.reply_offset+20}else{total>self.page_offset+20},"page_size":20,"page_offset":self.page_offset,"focused_topic":self.focused_topic.map(|h|hex(&h)),"reply_offset":self.reply_offset,"reply_total":reply_total,"members":self.view.members.iter().map(|(p,m)|json!({"id":URL_SAFE_NO_PAD.encode(p),"active":!m.revoked&&m.expires_at>now(),"status":if m.revoked{"revoked"}else if m.expires_at<=now(){"expired"}else{"active"},"inviter":URL_SAFE_NO_PAD.encode(&m.inviter),"expires_at":if m.expires_at==u64::MAX{None}else{Some(m.expires_at)}})).collect::<Vec<_>>(),"status":self.status,"draft":self.saved.as_ref().map(|s|&s.draft)})
+    }
+    fn search(&self, query: &str, offset: usize) -> Result<Value> {
+        let query = query.trim();
+        ensure!(
+            !query.is_empty() && query.chars().count() <= 100 && offset <= MAX_RECORDS,
+            "搜索词或页码无效"
+        );
+        let needle = query.to_lowercase();
+        let saved = self
+            .saved
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("尚未加入论坛"))?;
+        let mut total = 0;
+        let mut results = vec![];
+        for topic in &self.view.topics {
+            if topic.hidden {
+                continue;
+            }
+            let matched = topic.heads.iter().find_map(|id| {
+                let r = &saved.forum.records[id];
+                let Action::Content { title, body, .. } = &r.record.action else {
+                    return None;
+                };
+                let text = saved
+                    .forum
+                    .body(body)
+                    .and_then(|b| std::str::from_utf8(b).ok());
+                if title.to_lowercase().contains(&needle)
+                    || text.is_some_and(|t| t.to_lowercase().contains(&needle))
+                {
+                    Some((title, text))
+                } else {
+                    None
+                }
+            });
+            if let Some((title, text)) = matched {
+                if total >= offset && results.len() < 20 {
+                    results.push(json!({"id":hex(&topic.root),"topic_id":hex(&topic.reply_to.unwrap_or(topic.root)),"title":title,"excerpt":text.map(|t|t.chars().take(160).collect::<String>()),"body_cached":text.is_some()}));
+                }
+                total += 1;
+            }
+        }
+        Ok(json!({"query":query,"total":total,"offset":offset,"page_size":20,"results":results}))
     }
     fn apply_governance(&mut self, records: Vec<SignedRecord>) -> Result<()> {
         ensure!(records.len() <= 256, "治理记录过多");
@@ -595,6 +670,11 @@ impl Worker {
         let mut attachment = None;
         match request {
             ForumRequest::State => {}
+            ForumRequest::Search { query, offset } => {
+                let search = self.search(&query, offset)?;
+                return Ok(json!({"state":self.state(),"search":search}));
+            }
+            ForumRequest::ReadExport { .. } => anyhow::bail!("附件数据仅限原生调用"),
             ForumRequest::Page { offset } => {
                 ensure!(
                     offset
@@ -1258,7 +1338,7 @@ impl Worker {
         loop {
             tokio::select! {
                 _=ticks.tick()=>{
-                    match rx.try_recv(){Ok(command)=>{let result=self.command(command.request,&mut swarm);let _=command.reply.send(result);},Err(mpsc::TryRecvError::Disconnected)=>break,Err(mpsc::TryRecvError::Empty)=>{}}
+                    match rx.try_recv(){Ok(command)=>{if let Some(raw)=command.raw{let result=match command.request{ForumRequest::ReadExport{hash}=>parse_hash(&hash).and_then(|h|self.read_export_bytes(h)),_=>Err(anyhow::anyhow!("无效原生请求"))};let _=raw.send(result);}else{let result=self.command(command.request,&mut swarm);let _=command.reply.send(result);}},Err(mpsc::TryRecvError::Disconnected)=>break,Err(mpsc::TryRecvError::Empty)=>{}}
                     if last_sync.elapsed()>Duration::from_secs(10){
                         for peer in self.peers.clone(){if !self.requests.values().any(|p|p.peer==peer)&&self.queues.get(&peer).is_none_or(VecDeque::is_empty){self.enqueue(peer,Query::Hello{governance:self.governance()});}}
                         last_sync=Instant::now();
@@ -1361,7 +1441,12 @@ mod tests {
         .unwrap();
         b.handle(ForumRequest::Sync).unwrap();
         wait(|| state(&b)["topics"].as_array().unwrap().len() == 1);
-        wait(||state(&a)["topics"][0]["versions"][0]["body_copies"].as_u64().unwrap()>=2);
+        wait(|| {
+            state(&a)["topics"][0]["versions"][0]["body_copies"]
+                .as_u64()
+                .unwrap()
+                >= 2
+        });
         let hash = state(&b)["topics"][0]["versions"][0]["body_hash"]
             .as_str()
             .unwrap()
@@ -1402,6 +1487,14 @@ mod tests {
             })
         });
         let target = b_dir.path().join("export");
+        assert_eq!(b.read_export(hash.clone()).unwrap(), payload);
+        let search = b
+            .handle(ForumRequest::Search {
+                query: "中文".into(),
+                offset: 0,
+            })
+            .unwrap();
+        assert_eq!(search["search"]["total"], 1);
         b.export(hash, std::fs::File::create(&target).unwrap())
             .unwrap();
         assert_eq!(std::fs::read(target).unwrap(), payload);

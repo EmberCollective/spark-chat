@@ -179,7 +179,7 @@ impl Worker {
         );
         Ok(Some(bytes))
     }
-    pub(super) fn export_file(&mut self, hash: Digest, mut file: std::fs::File) -> Result<()> {
+    pub(super) fn read_export_bytes(&mut self, hash: Digest) -> Result<Vec<u8>> {
         ensure!(
             self.allowed(&self.key.public().to_peer_id()),
             "当前成员没有附件权限"
@@ -204,8 +204,6 @@ impl Worker {
             bytes.zeroize();
         }
         ensure!(Digest::from(digest.finalize()) == hash, "缓存附件校验失败");
-        file.write_all(&verified)?;
-        file.sync_all()?;
         self.saved
             .as_mut()
             .unwrap()
@@ -214,6 +212,12 @@ impl Worker {
             .unwrap()
             .used = now();
         self.dirty = true;
+        Ok(std::mem::take(&mut *verified))
+    }
+    pub(super) fn export_file(&mut self, hash: Digest, mut file: std::fs::File) -> Result<()> {
+        let verified = zeroize::Zeroizing::new(self.read_export_bytes(hash)?);
+        file.write_all(&verified)?;
+        file.sync_all()?;
         Ok(())
     }
     pub(super) fn preview(&mut self, hash: Digest) -> Result<Value> {
