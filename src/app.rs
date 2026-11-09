@@ -212,6 +212,14 @@ impl App {
     }
 
     fn activate(&mut self, id: &str) {
+        if id.is_empty() {
+            if let Some(previous) = self.peer_pid.clone() {
+                let mut state = ChatState::default();
+                self.swap_chat(&mut state);
+                self.chats.insert(previous, state);
+            }
+            return;
+        }
         if self.peer_pid.as_deref() == Some(id) {
             return;
         }
@@ -1115,6 +1123,9 @@ mod tests {
         let vault = Vault::unlock("test-password", &keyfile, &dir).unwrap();
         app.open_image_cache(&vault).unwrap();
         app.vault = Some(vault);
+        assert!(app.image_to("alice", encoded.get_ref()).is_err());
+        assert!(app.peer_pid.is_none());
+        assert!(!app.session_snapshots().iter().any(|session| session.id.is_empty()));
         assert_eq!(app.select_session("alice").unwrap().images[0].id, image.id);
         assert!(!app.image_preview("alice", &image.id).unwrap().is_empty());
         assert!(app.image_to("alice", encoded.get_ref()).is_err(), "offline restored history cannot send");
