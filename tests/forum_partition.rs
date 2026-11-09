@@ -4,7 +4,7 @@ use spark_chat::forum::service::{ForumRequest, ForumService};
 use std::time::{Duration, Instant};
 
 fn state(node: &ForumService) -> Value {
-    node.handle(ForumRequest::State).unwrap()["state"].clone()
+    node.handle(ForumRequest::Page { offset: 0 }).unwrap()["state"].clone()
 }
 
 fn wait(label: &str, mut predicate: impl FnMut() -> bool) {
@@ -67,7 +67,12 @@ fn topic(value: &Value, root: &str) -> Value {
 fn projection(mut value: Value) -> Value {
     for topic in value["topics"].as_array_mut().unwrap() {
         for version in topic["versions"].as_array_mut().unwrap() {
-            version.as_object_mut().unwrap().remove("body");
+            for key in ["body", "body_copies", "record_copies"] {
+                version.as_object_mut().unwrap().remove(key);
+            }
+            for attachment in version["attachments"].as_array_mut().unwrap() {
+                attachment.as_object_mut().unwrap().remove("copies");
+            }
         }
         topic.as_object_mut().unwrap().remove("merged_body");
     }
@@ -94,6 +99,27 @@ fn six_members_reconcile_three_partitions_without_admin_and_keep_offline_author_
             )
         })
         .collect();
+    publish(&admin, None, None, vec![], "共同原帖", "原文\n第二行\n");
+    let root = state(&admin)["topics"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    admin
+        .handle(ForumRequest::Checkpoint {
+            records: vec![root.clone()],
+        })
+        .unwrap();
+    for node in nodes.iter().flatten() {
+        admin
+            .handle(ForumRequest::Admit {
+                member: state(node)["own_public"].as_str().unwrap().into(),
+                inviter: None,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+    // Cold invitations carry signed checkpoint evidence, but no live peer addresses.
+    // Never connect all members to one host: neighbor discovery would heal the intended partition.
     for node in nodes.iter().flatten() {
         let invitation = admin
             .handle(ForumRequest::Admit {
@@ -106,26 +132,10 @@ fn six_members_reconcile_three_partitions_without_admin_and_keep_offline_author_
             .unwrap()
             .to_owned();
         node.handle(ForumRequest::Join { invitation }).unwrap();
-        connect(node, &admin);
+        assert_eq!(state(node)["topics"].as_array().unwrap().len(), 1);
+        assert_eq!(state(node)["peers"], 0);
     }
-    publish(&admin, None, None, vec![], "共同原帖", "原文\n第二行\n");
-    let root = state(&admin)["topics"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    for node in nodes.iter().flatten() {
-        node.handle(ForumRequest::Sync).unwrap();
-    }
-    wait("initial index", || {
-        nodes
-            .iter()
-            .flatten()
-            .all(|n| state(n)["topics"].as_array().unwrap().len() == 1)
-    });
     drop(admin);
-    wait("admin disconnected", || {
-        nodes.iter().flatten().all(|n| state(n)["peers"] == 0)
-    });
 
     for (a, b) in [(0, 1), (2, 3), (4, 5)] {
         connect(nodes[a].as_ref().unwrap(), nodes[b].as_ref().unwrap());
@@ -161,10 +171,15 @@ fn six_members_reconcile_three_partitions_without_admin_and_keep_offline_author_
         );
     }
     wait("local partition publication", || {
-        nodes
-            .iter()
-            .flatten()
-            .all(|n| state(n)["topics"].as_array().unwrap().len() == 3)
+        nodes.iter().flatten().all(|n| {
+            state(n)["topics"].as_array().unwrap().len() == 2
+                && n.handle(ForumRequest::Topic {
+                    id: root.clone(),
+                    offset: 0,
+                })
+                .unwrap()["state"]["reply_total"]
+                    == 1
+        })
     });
     connect(nodes[0].as_ref().unwrap(), nodes[2].as_ref().unwrap());
     connect(nodes[0].as_ref().unwrap(), nodes[4].as_ref().unwrap());
@@ -174,11 +189,28 @@ fn six_members_reconcile_three_partitions_without_admin_and_keep_offline_author_
     wait("all partition indices converge", || {
         let values: Vec<_> = nodes.iter().flatten().map(state).collect();
         values.iter().all(|v| {
-            v["topics"].as_array().unwrap().len() == 7
+            v["topics"].as_array().unwrap().len() == 4
                 && topic(v, &root)["heads"].as_array().unwrap().len() == 3
         }) && values
             .iter()
             .all(|v| projection(v.clone()) == projection(values[0].clone()))
+            && {
+                let threads: Vec<_> = nodes
+                    .iter()
+                    .flatten()
+                    .map(|n| {
+                        n.handle(ForumRequest::Topic {
+                            id: root.clone(),
+                            offset: 0,
+                        })
+                        .unwrap()["state"]
+                            .clone()
+                    })
+                    .collect();
+                threads.iter().all(|v| {
+                    v["reply_total"] == 3 && projection(v.clone()) == projection(threads[0].clone())
+                })
+            }
     });
     let before = state(nodes[0].as_ref().unwrap());
     let heads = topic(&before, &root)["heads"]
